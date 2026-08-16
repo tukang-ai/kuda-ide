@@ -1,0 +1,90 @@
+[package]
+name = "kuda-ide"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+
+[dependencies]
+# === Tauri Core ===
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+
+# === Async Runtime & Traits ===
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"                # Required for #[async_trait] in traits
+futures = "0.3"
+
+# === File System & Security ===
+notify = "7"
+notify-debouncer-full = "0.4"
+ignore = "0.4"                     # .gitignore-aware file walking (from ripgrep)
+walkdir = "2"
+trash = "5"                        # Safe file deletion (moves to OS Trash)
+
+# === Code Indexing & AST ===
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-json = "0.24"
+tree-sitter-toml = "0.20"
+tree-sitter-html = "0.23"
+tree-sitter-css = "0.23"
+grep = "0.3"                       # ripgrep's search library
+grep-regex = "0.1"
+grep-searcher = "0.1"
+grep-matcher = "0.1"
+
+# === Diff Engine ===
+similar = { version = "2", features = ["inline", "unicode"] }
+dissimilar = "1"
+
+# === Terminal PTY ===
+portable-pty = "0.8"               # Direct PTY lifecycle management (no plugin overhead)
+
+# === LLM, HTTP & Tokenizer ===
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+reqwest-eventsource = "0.6"
+eventsource-stream = "0.2"
+tiktoken-rs = { version = "0.6", default-features = false }  # Pre-call token budget estimation
+keyring = "3"                      # OS Keychain integration for API Keys
+html5ever = "0.27"
+selectors = "0.25"
+
+# === Security Gateway ===
+jsonwebtoken = "9"
+sha2 = "0.10"
+sysinfo = "0.32"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
+
+# === Serialization ===
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.138"
+memchr = "2.7.4"
+base64 = "0.22"
+
+# === Error Handling & Logging ===
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# === Utilities ===
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+regex = "1"
+yoke = { version = "0.7", features = ["derive", "zerofrom"] }
+zerofrom = { version = "0.1", features = ["derive"] }
+zerovec = { version = "0.10", features = ["derive", "yoke"] }
+lock_api = "0.4"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+tauri-plugin = "2"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

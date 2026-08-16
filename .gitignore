@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+.cargo_local/
+
+# Build & Output
+dist/
+dist-isolation/
+src-tauri/target/
+
+# Local IDE & Temp App Data
+.kuda-ide/
+*.tmp
+*.log
+
+# System files
+.DS_Store
+Thumbs.db
+._*
+
+# Environment variables
+.env
+.env.local
+.env.*.local

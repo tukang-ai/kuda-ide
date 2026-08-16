@@ -1,0 +1,3 @@
+[build]
+# Redirect build artifacts to local internal SSD to prevent macOS AppleDouble (._) metadata generation on external USB drives
+target-dir = "/Users/macmini/.gemini/antigravity-ide/targets/kuda-ide"
