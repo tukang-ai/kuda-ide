@@ -158,7 +158,7 @@ export const SettingsModal: React.FC = () => {
 
   const checkHub = async () => {
     try {
-      const res = await fetchWithTimeout('http://localhost:8090/api/v1/plans', {}, 4000);
+      const res = await fetchWithTimeout(`${ipc.HUB_BASE_URL}/api/v1/plans`, {}, 4000);
       setHubOnline(res.ok);
     } catch {
       setHubOnline(false);
@@ -169,7 +169,7 @@ export const SettingsModal: React.FC = () => {
     try {
       const headers: Record<string, string> = {};
       if (hubToken) headers['Authorization'] = `Bearer ${hubToken}`;
-      const res = await fetchWithTimeout('http://localhost:8090/api/v1/user/usage', { headers }, 4000);
+      const res = await fetchWithTimeout(`${ipc.HUB_BASE_URL}/api/v1/user/usage`, { headers }, 4000);
       if (res.ok) {
         const data = await res.json();
         setUserUsage(data);
@@ -185,7 +185,7 @@ export const SettingsModal: React.FC = () => {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (hubToken) headers['Authorization'] = `Bearer ${hubToken}`;
       const res = await fetchWithTimeout(
-        'http://localhost:8090/api/v1/user/plan',
+        `${ipc.HUB_BASE_URL}/api/v1/user/plan`,
         {
           method: 'POST',
           headers,
@@ -212,9 +212,9 @@ export const SettingsModal: React.FC = () => {
     const loginCode = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
     try {
       try {
-        const redirect = encodeURIComponent('http://localhost:8090/api/v1/auth/github/callback');
+        const redirect = encodeURIComponent(`${ipc.HUB_BASE_URL}/api/v1/auth/github/callback`);
         const urlRes = await fetchWithTimeout(
-          `http://localhost:8090/api/v1/auth/github/url?state=${loginCode}&redirect_uri=${redirect}`,
+          `${ipc.HUB_BASE_URL}/api/v1/auth/github/url?state=${loginCode}&redirect_uri=${redirect}`,
           {},
           8000,
         );
@@ -230,7 +230,7 @@ export const SettingsModal: React.FC = () => {
         }
         await ipc.openExternalUrl(data.url);
       } catch {
-        setNote('Hub server unreachable. Start the Hub Server on port 8090 first.');
+        setNote('Hub server unreachable. Pastikan hub online di kuda-ide.my.id.');
         return;
       }
 
@@ -242,7 +242,7 @@ export const SettingsModal: React.FC = () => {
         await new Promise((r) => setTimeout(r, 1500));
         try {
           const res = await fetchWithTimeout(
-            `http://localhost:8090/api/v1/auth/pending?code=${loginCode}`,
+            `${ipc.HUB_BASE_URL}/api/v1/auth/pending?code=${loginCode}`,
             { cache: 'no-store' },
             8000,
           );
@@ -326,7 +326,7 @@ export const SettingsModal: React.FC = () => {
       }
 
       try {
-        const plansRes = await fetchWithTimeout('http://localhost:8090/api/v1/plans', {}, 4000);
+        const plansRes = await fetchWithTimeout(`${ipc.HUB_BASE_URL}/api/v1/plans`, {}, 4000);
         setHubOnline(plansRes.ok);
         if (plansRes.ok) {
           const data = await plansRes.json();
@@ -341,12 +341,12 @@ export const SettingsModal: React.FC = () => {
       // Model list + rekomendasi setting default dari hub (endpoint terpisah) —
       // dipakai dropdown pemilihan model (varian sejenis bisa punya harga koin berbeda).
       try {
-        const modelsRes = await fetchWithTimeout('http://localhost:8090/api/v1/models', {}, 4000);
+        const modelsRes = await fetchWithTimeout(`${ipc.HUB_BASE_URL}/api/v1/models`, {}, 4000);
         if (modelsRes.ok) {
           const data = await modelsRes.json();
           if (Array.isArray(data.data)) setHubModels(data.data);
         }
-        const recRes = await fetchWithTimeout('http://localhost:8090/api/v1/models/recommendations', {}, 4000);
+        const recRes = await fetchWithTimeout(`${ipc.HUB_BASE_URL}/api/v1/models/recommendations`, {}, 4000);
         if (recRes.ok) {
           const data = await recRes.json();
           if (data.recommendations) setHubRecommendations(data.recommendations);
@@ -773,14 +773,14 @@ export const SettingsModal: React.FC = () => {
                   }}
                 >
                   {hubOnline === false
-                    ? 'Hub Offline (8090)'
+                    ? 'Hub Offline'
                     : hubOnline === true
-                      ? 'Hub Online (8090)'
+                      ? 'Hub Online'
                       : 'Checking Hub…'}
                 </span>
               </div>
               <p className="text-muted" style={{ fontSize: 12, lineHeight: 1.5, marginBottom: 14 }}>
-                Dynamic plan tiers & pricing are loaded directly from the Hub Server (<code>http://localhost:8090/api/v1/plans</code>) so limits stay automatically synchronized across devices.
+                Dynamic plan tiers & pricing are loaded directly from the Hub Server (<code>{ipc.HUB_BASE_URL}/api/v1/plans</code>) so limits stay automatically synchronized across devices.
               </p>
 
               {/* GitHub OAuth & Token Bar */}
@@ -845,7 +845,7 @@ export const SettingsModal: React.FC = () => {
                             // Fetch the rotating session key directly from the hub.
                             try {
                               const r = await fetchWithTimeout(
-                                'http://localhost:8090/api/v1/auth/refresh',
+                                `${ipc.HUB_BASE_URL}/api/v1/auth/refresh`,
                                 {
                                   method: 'POST',
                                   headers: { Authorization: `Bearer ${master}` },

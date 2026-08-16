@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use crate::error::{AppError, Result};
 
+/// Base URL server Kuda Hub (publik via Cloudflare Tunnel).
+/// Satu-satunya sumber kebenaran; semua harga/plans/model diambil hub API.
+pub const HUB_BASE_URL: &str = "https://kuda-ide.my.id/api/v1";
+
 /// A configured LLM provider. Each provider owns its own API key (kept in the OS
 /// Keychain under `provider_key.<id>`) and lists the model names it exposes.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -93,10 +97,15 @@ impl Default for ProviderConfig {
     fn default() -> Self {
         let hub_models = vec![
             "thinker".to_string(),
+            "thinker_plus".to_string(),
             "reviewer".to_string(),
+            "reviewer_cheap".to_string(),
             "planning_writer".to_string(),
+            "planning_writer_plus".to_string(),
             "executor_code".to_string(),
+            "executor_code_plus".to_string(),
             "executor_design".to_string(),
+            "executor_design_cheap".to_string(),
             "executor_reviewer".to_string(),
             "rlm_model".to_string(),
             "rlm_verifier".to_string(),
@@ -109,7 +118,7 @@ impl Default for ProviderConfig {
             providers: vec![Provider {
                 id: "kuda_hub".to_string(),
                 name: "Kuda Developer Hub (Subscription Plan)".to_string(),
-                base_url: "http://localhost:8090/api/v1".to_string(),
+                base_url: HUB_BASE_URL.to_string(),
                 models: hub_models,
             }],
             agent: AgentConfig {
@@ -142,7 +151,16 @@ impl ProviderConfigManager {
             return Ok(ProviderConfig::default());
         }
         let content = fs::read_to_string(&self.file_path)?;
-        let cfg: ProviderConfig = serde_json::from_str(&content)?;
+        let mut cfg: ProviderConfig = serde_json::from_str(&content)?;
+        // Migrasi otomatis: kuda_hub provider yang masih menunjuk ke localhost
+        // (config lama) diarahkan ke domain publik hub.
+        for p in cfg.providers.iter_mut() {
+            if p.id == "kuda_hub"
+                && (p.base_url.contains("localhost:8090") || p.base_url.contains("127.0.0.1:8090"))
+            {
+                p.base_url = HUB_BASE_URL.to_string();
+            }
+        }
         Ok(cfg)
     }
 

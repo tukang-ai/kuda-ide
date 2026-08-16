@@ -9,6 +9,7 @@ import 'highlight.js/styles/github-dark.css';
 import { useAgent, UiMessage, UiToolCall, PendingExternalRequest, PendingPlanDecision, PendingDirection } from '../store/agent';
 import { useWorkspace, reloadOpenTabsFromDisk } from '../store/workspace';
 import { useLayout } from '../store/layout';
+import { HUB_BASE_URL } from '../lib/ipc';
 import { buildLiveItems } from '../lib/liveItems';
 import type { ChatMessage } from '../types';
 
@@ -570,7 +571,7 @@ export const AgentPanel: React.FC = () => {
     let cancelled = false;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 4000);
-    fetch('http://localhost:8090/api/v1/models', { signal: ctrl.signal })
+    fetch(`${HUB_BASE_URL}/api/v1/models`, { signal: ctrl.signal })
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
         clearTimeout(timer);

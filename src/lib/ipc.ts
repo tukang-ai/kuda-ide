@@ -177,6 +177,11 @@ export const agentSaveKey = (provider: string, apiKey: string): Promise<void> =>
 export const agentHasKey = (provider: string): Promise<boolean> =>
   invoke<boolean>('agent_has_key', { provider });
 
+/// Base URL server Kuda Hub (publik lewat Cloudflare Tunnel).
+/// Semua daftar harga / plans / model diambil LANGSUNG dari sini, jadi ubah
+/// sekali di hub -> otomatis sinkron di semua device tanpa edit IDE.
+export const HUB_BASE_URL = 'https://kuda-ide.my.id';
+
 export interface HubSessionInfo {
   token_key: string;
   session_key: string;
