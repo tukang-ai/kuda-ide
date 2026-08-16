@@ -1,0 +1,86 @@
+# Build KudaIDE untuk semua OS (Tauri v2).
+# - Tiap push ke main / PR / manual: build & upload artifact per platform.
+# - Tiap tag `v*` (mis. v0.1.0): buat GitHub Release (draft) berisi installer
+#   macOS (.dmg), Linux (.deb/.AppImage), dan Windows (.msi/.exe).
+name: Build KudaIDE (multi-OS)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            name: linux
+          - platform: macos-latest
+            name: macos
+          - platform: windows-latest
+            name: windows
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependensi Linux (WebKit/GTK)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install dependensi frontend
+        run: npm ci
+
+      - name: Build & rilis (saat tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "KudaIDE ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+
+      - name: Build Tauri (bukan tag)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: npm run tauri -- build
+
+      - name: Upload artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kudaide-${{ matrix.name }}
+          path: |
+            src-tauri/target/release/bundle/**/*
+          if-no-files-found: error
