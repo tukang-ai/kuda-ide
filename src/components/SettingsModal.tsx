@@ -1,5 +1,4 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   KeyRound, Eye, EyeOff, X, Plus, Trash2, Save, Layers, Workflow, ShieldAlert, CheckCircle2,
@@ -220,31 +219,30 @@ export const SettingsModal: React.FC = () => {
     const loginCode = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
 
     // Start loopback HTTP server di 127.0.0.1 (anti-clipboard handoff).
-    // Halaman callback hub akan POST `pk_...` ke port ini; Rust emit event
-    // `auth:pickup` yang kita listen di bawah.
     let loopbackPort = 0;
     try {
-      loopbackPort = await invoke<number>('auth_start_loopback');
+      loopbackPort = await ipc.authStartLoopback();
     } catch (e) {
       setNote(`Gagal start loopback server: ${e}`);
       setSigningIn(false);
       return;
     }
 
-    // Listen event dari Rust side saat POST /pickup diterima dari browser.
+    // Dual-Channel Handoff Detection:
+    // Channel 1: Listen event dari Tauri `auth:pickup`
+    // Channel 2: Active memory polling `ipc.authGetPickup()` setiap 400ms
     let unlisten: UnlistenFn | null = null;
-    const pickupPromise = new Promise<string | null>((resolve) => {
-      listen<string>('auth:pickup', (ev) => {
-        if (ev.payload && /^pk_[a-f0-9]{16,}$/i.test(ev.payload)) {
-          resolve(ev.payload);
-        }
-      }).then((fn) => {
-        unlisten = fn;
-      });
-      setTimeout(() => resolve(null), 300000);
-    });
+    let eventPickup: string | null = null;
 
     try {
+      const unlistenPromise = listen<string>('auth:pickup', (ev) => {
+        if (ev.payload && /^pk_[a-f0-9]{16,}$/i.test(ev.payload)) {
+          eventPickup = ev.payload;
+        }
+      });
+      unlisten = await unlistenPromise.catch(() => null);
+
+      let canonicalCode = loginCode;
       try {
         const redirect = encodeURIComponent(`${ipc.HUB_BASE_URL}/api/v1/auth/github/callback`);
         const urlRes = await fetchWithTimeout(
@@ -262,15 +260,34 @@ export const SettingsModal: React.FC = () => {
           setNote('GitHub OAuth is not configured on the Hub Server.');
           return;
         }
+        if (data.code) {
+          canonicalCode = data.code;
+        }
         await ipc.openExternalUrl(data.url);
       } catch {
         setNote('Hub server unreachable. Pastikan hub online di kuda-ide.my.id.');
         return;
       }
 
-      // Tunggu event pickup dari loopback (browser POST pk_ ke 127.0.0.1:port).
+      // Tunggu event pickup dari loopback (browser kirim pk_ ke 127.0.0.1:port).
       setNote('Menunggu browser mengirim kode pickup ke IDE (otomatis)…');
-      const secret = await pickupPromise;
+
+      // Loop Dual-Channel: pantau event ATAU baca memori Rust secara berkala
+      let secret: string | null = null;
+      const waitStart = Date.now();
+      while (Date.now() - waitStart < 300000 && mountedRef.current) {
+        if (eventPickup) {
+          secret = eventPickup;
+          break;
+        }
+        const memSecret = await ipc.authGetPickup().catch(() => null);
+        if (memSecret && /^pk_[a-f0-9]{16,}$/i.test(memSecret)) {
+          secret = memSecret;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 400));
+      }
+
       if (!mountedRef.current) return;
       if (!secret) {
         setNote('Login timed out (5 menit). Coba lagi, atau pakai kolom manual di bawah.');
@@ -285,7 +302,7 @@ export const SettingsModal: React.FC = () => {
         if (!mountedRef.current) return;
         try {
           const res = await fetchWithTimeout(
-            `${ipc.HUB_BASE_URL}/api/v1/auth/pending?code=${loginCode}&pickup_secret=${encodeURIComponent(secret)}`,
+            `${ipc.HUB_BASE_URL}/api/v1/auth/pending?code=${canonicalCode}&pickup_secret=${encodeURIComponent(secret)}`,
             { cache: 'no-store' },
             8000,
           );
@@ -317,7 +334,7 @@ export const SettingsModal: React.FC = () => {
       setNote('Login timed out (pickup diterima tapi token tidak terambil). Coba lagi.');
     } finally {
       if (unlisten) unlisten();
-      invoke('auth_stop_loopback').catch(() => {});
+      ipc.authStopLoopback().catch(() => {});
       setSigningIn(false);
     }
   };

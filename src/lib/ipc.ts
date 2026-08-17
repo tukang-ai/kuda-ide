@@ -227,6 +227,15 @@ export const agentHubAccount = (): Promise<HubAccount> =>
 export const agentHubSignOut = (): Promise<void> =>
   invoke<void>('agent_hub_sign_out');
 
+export const authStartLoopback = (): Promise<number> =>
+  invoke<number>('auth_start_loopback');
+
+export const authStopLoopback = (): Promise<void> =>
+  invoke<void>('auth_stop_loopback');
+
+export const authGetPickup = (): Promise<string | null> =>
+  invoke<string | null>('auth_get_pickup');
+
 export interface ProviderInfo {
   id: string;
   name: string;

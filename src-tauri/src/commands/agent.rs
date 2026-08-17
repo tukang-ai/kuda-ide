@@ -115,6 +115,17 @@ pub async fn auth_stop_loopback(state: State<'_, AppState>) -> Result<()> {
     Ok(())
 }
 
+/// Ambil pickup code yang tersimpan di loopback server saat ini (jika ada).
+#[tauri::command]
+pub async fn auth_get_pickup(state: State<'_, AppState>) -> Result<Option<String>> {
+    let slot = state.auth_loopback.lock().await;
+    if let Some(srv) = slot.as_ref() {
+        Ok(srv.pickup.lock().await.clone())
+    } else {
+        Ok(None)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AgentRunResult {
     pub chat_session_id: String,

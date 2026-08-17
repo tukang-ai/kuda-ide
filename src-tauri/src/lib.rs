@@ -74,6 +74,7 @@ pub fn run() {
             commands::agent::agent_hub_sign_out,
             commands::agent::auth_start_loopback,
             commands::agent::auth_stop_loopback,
+            commands::agent::auth_get_pickup,
             commands::agent::provider_list,
             commands::agent::provider_save,
             commands::agent::provider_delete,
