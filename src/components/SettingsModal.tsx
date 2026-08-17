@@ -262,38 +262,22 @@ export const SettingsModal: React.FC = () => {
 
       setNote('Menunggu otorisasi GitHub di browser selesai…');
 
-      // 3. Poll Hub Server secara langsung via HTTPS menggunakan PKCE verifier
+      // 3. Poll Hub Server langsung via Rust IPC (kebal CORS, langsung persist ke disk di Rust)
       const pollStarted = Date.now();
-      while (Date.now() - pollStarted < 300000) {
-        if (!mountedRef.current) return;
+      while (Date.now() - pollStarted < 300000 && mountedRef.current) {
         try {
-          const res = await fetchWithTimeout(
-            `${ipc.HUB_BASE_URL}/api/v1/auth/pending?verifier=${encodeURIComponent(verifier)}`,
-            { cache: 'no-store' },
-            8000,
-          );
-          if (res.ok) {
-            const auth = await res.json();
-            if (auth?.token_key) {
-              await ipc.agentSaveHubCredentials(
-                auth.token_key,
-                auth.session_key,
-                auth.session_expires_at,
-                auth.email,
-                auth.plan_tier,
-              );
-              setHubToken(auth.token_key);
-              setNote(
-                `Signed in as ${auth.email} (${auth.plan_tier}) — connected automatically (PKCE). Session key aktif 30 menit & auto-renew.`,
-              );
-              await checkKey();
-              setHubAccount(await ipc.agentHubAccount().catch(() => null));
-              await fetchUsage();
-              return;
-            }
+          const account = await ipc.agentPollHubLogin(verifier);
+          if (account && account.logged_in) {
+            setHubAccount(account);
+            setNote(
+              `Signed in as ${account.email} (${account.plan_tier}) — connected automatically. Session key aktif 30 menit & auto-renew.`,
+            );
+            await checkKey();
+            await fetchUsage();
+            return;
           }
         } catch {
-          /* hub briefly unreachable; keep polling */
+          /* pending authorization; keep polling */
         }
         await new Promise((r) => setTimeout(r, 1500));
       }

@@ -93,7 +93,31 @@ impl AppState {
 
     pub fn get_app_data_dir(&self) -> Option<PathBuf> {
         let dir = self.app_data_dir.lock().unwrap();
-        dir.clone()
+        if let Some(ref d) = *dir {
+            return Some(d.clone());
+        }
+        #[cfg(target_os = "macos")]
+        if let Ok(home) = std::env::var("HOME") {
+            let path = PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("com.kuda.ide");
+            let _ = std::fs::create_dir_all(&path);
+            return Some(path);
+        }
+        #[cfg(windows)]
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let path = PathBuf::from(appdata).join("kuda-ide");
+            let _ = std::fs::create_dir_all(&path);
+            return Some(path);
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        if let Ok(home) = std::env::var("HOME") {
+            let path = PathBuf::from(home).join(".config").join("kuda-ide");
+            let _ = std::fs::create_dir_all(&path);
+            return Some(path);
+        }
+        None
     }
 
     pub fn require_project_root(&self) -> crate::error::Result<PathBuf> {

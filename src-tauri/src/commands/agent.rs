@@ -82,6 +82,59 @@ pub fn agent_hub_sign_out(state: State<'_, AppState>) -> Result<()> {
     crate::agent::hub_session::clear_hub_credentials(&app_data_dir)
 }
 
+/// Polls Hub Server directly from Rust (immune to browser CORS / webview sandbox),
+/// and automatically writes credentials to disk immediately upon resolution.
+#[tauri::command]
+pub async fn agent_poll_hub_login(
+    state: State<'_, AppState>,
+    verifier: String,
+) -> Result<crate::agent::hub_session::HubAccountInfo> {
+    let app_data_dir = state.require_app_data_dir()?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| AppError::General(format!("Failed to build HTTP client: {e}")))?;
+
+    let verifier_clean = verifier.trim();
+    if verifier_clean.is_empty() {
+        return Err(AppError::General("Verifier cannot be empty".to_string()));
+    }
+
+    let base_url = crate::agent::provider_config::HUB_BASE_URL.trim_end_matches('/');
+    let url = format!("{}/auth/pending?verifier={}", base_url, verifier_clean);
+
+    let resp = client.get(&url).send().await
+        .map_err(|e| AppError::General(format!("Hub poll network error: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(AppError::General(format!("Pending authorization (HTTP {})", resp.status())));
+    }
+
+    let auth: crate::agent::hub_session::HubSessionInfo = resp.json().await
+        .map_err(|e| AppError::General(format!("Failed to parse Hub auth response: {e}")))?;
+
+    if auth.token_key.is_empty() {
+        return Err(AppError::General("Hub returned empty master token".to_string()));
+    }
+
+    // Persist immediately to disk in Rust
+    crate::agent::hub_session::save_hub_credentials(
+        &app_data_dir,
+        &auth.token_key,
+        &auth.session_key,
+        &auth.session_expires_at,
+        &auth.email,
+        &auth.plan_tier,
+    )?;
+
+    Ok(crate::agent::hub_session::HubAccountInfo {
+        logged_in: true,
+        email: auth.email,
+        plan_tier: auth.plan_tier,
+        session_expires_at: auth.session_expires_at,
+    })
+}
+
 /// Spawn loopback HTTP server di 127.0.0.1 untuk OAuth handoff. Kembalikan port
 /// yang dipakai (frontend akan menyertakannya ke hub `/auth/github/url`).
 #[tauri::command]

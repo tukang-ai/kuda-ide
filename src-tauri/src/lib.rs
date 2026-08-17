@@ -72,6 +72,7 @@ pub fn run() {
             commands::agent::agent_has_hub_credentials,
             commands::agent::agent_hub_account,
             commands::agent::agent_hub_sign_out,
+            commands::agent::agent_poll_hub_login,
             commands::agent::auth_start_loopback,
             commands::agent::auth_stop_loopback,
             commands::agent::auth_get_pickup,

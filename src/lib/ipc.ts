@@ -227,6 +227,9 @@ export const agentHubAccount = (): Promise<HubAccount> =>
 export const agentHubSignOut = (): Promise<void> =>
   invoke<void>('agent_hub_sign_out');
 
+export const agentPollHubLogin = (verifier: string): Promise<HubAccount> =>
+  invoke<HubAccount>('agent_poll_hub_login', { verifier });
+
 export const authStartLoopback = (): Promise<number> =>
   invoke<number>('auth_start_loopback');
 
