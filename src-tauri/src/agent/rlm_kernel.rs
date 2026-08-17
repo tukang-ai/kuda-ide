@@ -735,7 +735,8 @@ fn stage_scratch_file(uuid: &str, code: &str) -> std::io::Result<PathBuf> {
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(&file_path, code)
+        std::fs::write(&file_path, code)?;
+        Ok(file_path)
     }
 }
 
