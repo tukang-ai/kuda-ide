@@ -24,7 +24,7 @@ impl Default for RateLimitConfig {
         // the budget is a coarse runaway-cost guard, not a tight throttle.
         Self {
             max_requests_per_minute: 300,
-            max_tokens_per_minute: 20_000,
+            max_tokens_per_minute: 100_000,
             daily_budget_cents: 10_000, // $100.00 daily runaway-cost guard
             cost_per_1k_input_tokens: 0.15,
             cost_per_1k_output_tokens: 0.60,
@@ -135,12 +135,13 @@ impl RateLimiter {
                 )));
             }
 
-            // Token bucket refill: rate = max_tokens_per_minute/60 per second,
-            // capped at `burst_capacity × rate` so a sudden swarm burst cannot
-            // hoard an infinite backlog (the old fields were never read, so the
-            // tokens-per-minute limit was never actually enforced).
+            // Token bucket refill: rate = max_tokens_per_minute/60 per second;
+            // capacity = the ENTIRE per-minute budget so a single large swarm
+            // request (RLM/planning reads big context) can always fit even after
+            // a burst — the old formula (rate × burst) capped the bucket at ~1.7k
+            // tokens, so any request larger than that was rejected forever.
             let rate_per_sec = self.config.max_tokens_per_minute.max(1) as f64 / 60.0;
-            let capacity = rate_per_sec * self.config.burst_capacity.max(1) as f64;
+            let capacity = self.config.max_tokens_per_minute as f64;
             let elapsed = now.saturating_sub(bucket.last_refill) as f64;
             if elapsed > 0.0 {
                 bucket.tokens = (bucket.tokens + elapsed * rate_per_sec).min(capacity);
