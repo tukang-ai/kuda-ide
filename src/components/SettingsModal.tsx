@@ -148,6 +148,8 @@ export const SettingsModal: React.FC = () => {
   const [note, setNote] = useState<string | null>(null);
   const [hubOnline, setHubOnline] = useState<boolean | null>(null);
   const [hubAccount, setHubAccount] = useState<ipc.HubAccount | null>(null);
+  const [pickupCode, setPickupCode] = useState('');
+  const pickupRef = useRef('');
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -208,7 +210,11 @@ export const SettingsModal: React.FC = () => {
 
   const signInWithGithub = async () => {
     setSigningIn(true);
-    setNote('Opening GitHub login… KudaIDE will connect automatically after you authorize.');
+    setPickupCode('');
+    pickupRef.current = '';
+    setNote(
+      'Opening GitHub login… setelah authorize di browser, kode pickup ter-copy otomatis & IDE mendeteksinya. Tidak perlu copas manual.',
+    );
     const loginCode = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
     try {
       try {
@@ -234,15 +240,35 @@ export const SettingsModal: React.FC = () => {
         return;
       }
 
-      // Poll the hub until the browser login completes (max 3 minutes). Each
-      // request is time-boxed so a half-open hub can never freeze the button.
+      // Poll the hub until the browser login completes (max 5 minutes; the
+      // server keeps the pending login for 5 min too). The pickup_secret from
+      // the browser page is required by the hub (two-factor anti token-theft).
+      //
+      // AUTO-DETECT: halaman callback hub sudah auto-copy `pk_...` ke clipboard
+      // saat load. IDE membaca clipboard tiap iterasi — begitu user selesai
+      // authorize di GitHub, kode pickup langsung terbaca tanpa copas manual.
+      // Fallback: user bisa tetap paste manual ke kolom input.
       const started = Date.now();
-      while (Date.now() - started < 180000) {
+      while (Date.now() - started < 300000) {
         if (!mountedRef.current) return;
         await new Promise((r) => setTimeout(r, 1500));
+        // Auto-detect pickup code dari clipboard (best-effort; butuh window focus).
+        if (!pickupRef.current) {
+          try {
+            const clip = await navigator.clipboard.readText();
+            const m = clip.match(/pk_[a-f0-9]{16,}/i);
+            if (m) {
+              pickupRef.current = m[0];
+              setPickupCode(m[0]);
+            }
+          } catch {
+            /* clipboard belum bisa dibaca (window belum focus) — coba lagi */
+          }
+        }
+        const secret = pickupRef.current.trim();
         try {
           const res = await fetchWithTimeout(
-            `${ipc.HUB_BASE_URL}/api/v1/auth/pending?code=${loginCode}`,
+            `${ipc.HUB_BASE_URL}/api/v1/auth/pending?code=${loginCode}&pickup_secret=${encodeURIComponent(secret)}`,
             { cache: 'no-store' },
             8000,
           );
@@ -798,7 +824,7 @@ export const SettingsModal: React.FC = () => {
                       disabled={signingIn}
                       title="Authenticate via GitHub OAuth — auto-connects without copying the token"
                     >
-                      <Github size={14} /> {signingIn ? 'Waiting for browser…' : 'Sign in with GitHub'}
+                      <Github size={14} /> {signingIn ? 'Waiting for pickup code…' : 'Sign in with GitHub'}
                     </button>
                   )}
                 </div>
@@ -826,6 +852,24 @@ export const SettingsModal: React.FC = () => {
                   </div>
                 ) : (
                   <div>
+                    {signingIn && (
+                      <div style={{ marginBottom: 10 }}>
+                        <label style={fieldStyle}>Kode Pickup dari halaman Browser (pk_…)</label>
+                        <input
+                          className="key-input"
+                          type="text"
+                          style={{ width: '100%' }}
+                          placeholder="pk_…"
+                          value={pickupCode}
+                          autoFocus
+                          spellCheck={false}
+                          onChange={(e) => {
+                            setPickupCode(e.target.value);
+                            pickupRef.current = e.target.value;
+                          }}
+                        />
+                      </div>
+                    )}
                     <label style={fieldStyle}>Developer Token (kuda_tok_...)</label>
                     <div className="key-row">
                       <input
