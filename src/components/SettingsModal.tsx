@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import {
   KeyRound, Eye, EyeOff, X, Plus, Trash2, Save, Layers, Workflow, ShieldAlert, CheckCircle2,
   Sparkles, Github, Zap, Check, Activity, LogOut,
@@ -252,17 +253,18 @@ export const SettingsModal: React.FC = () => {
       while (Date.now() - started < 300000) {
         if (!mountedRef.current) return;
         await new Promise((r) => setTimeout(r, 1500));
-        // Auto-detect pickup code dari clipboard (best-effort; butuh window focus).
+        // Auto-detect pickup code dari OS clipboard (native Tauri plugin,
+        // bukan navigator.clipboard yang diblok webview dev mode).
         if (!pickupRef.current) {
           try {
-            const clip = await navigator.clipboard.readText();
+            const clip = await invoke<string>('plugin:clipboard-manager|read_text');
             const m = clip.match(/pk_[a-f0-9]{16,}/i);
             if (m) {
               pickupRef.current = m[0];
               setPickupCode(m[0]);
             }
           } catch {
-            /* clipboard belum bisa dibaca (window belum focus) — coba lagi */
+            /* plugin belum siap — coba lagi iterasi berikutnya */
           }
         }
         const secret = pickupRef.current.trim();
