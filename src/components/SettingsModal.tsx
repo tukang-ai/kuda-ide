@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   KeyRound, Eye, EyeOff, X, Plus, Trash2, Save, Layers, Workflow, ShieldAlert, CheckCircle2,
   Sparkles, Github, Zap, Check, Activity, LogOut,
@@ -214,14 +215,40 @@ export const SettingsModal: React.FC = () => {
     setPickupCode('');
     pickupRef.current = '';
     setNote(
-      'Opening GitHub login… setelah authorize di browser, kode pickup ter-copy otomatis & IDE mendeteksinya. Tidak perlu copas manual.',
+      'Opening GitHub login… selesai authorize di browser, KudaIDE otomatis terhubung (loopback). Tidak perlu copas.',
     );
     const loginCode = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+
+    // Start loopback HTTP server di 127.0.0.1 (anti-clipboard handoff).
+    // Halaman callback hub akan POST `pk_...` ke port ini; Rust emit event
+    // `auth:pickup` yang kita listen di bawah.
+    let loopbackPort = 0;
+    try {
+      loopbackPort = await invoke<number>('auth_start_loopback');
+    } catch (e) {
+      setNote(`Gagal start loopback server: ${e}`);
+      setSigningIn(false);
+      return;
+    }
+
+    // Listen event dari Rust side saat POST /pickup diterima dari browser.
+    let unlisten: UnlistenFn | null = null;
+    const pickupPromise = new Promise<string | null>((resolve) => {
+      listen<string>('auth:pickup', (ev) => {
+        if (ev.payload && /^pk_[a-f0-9]{16,}$/i.test(ev.payload)) {
+          resolve(ev.payload);
+        }
+      }).then((fn) => {
+        unlisten = fn;
+      });
+      setTimeout(() => resolve(null), 300000);
+    });
+
     try {
       try {
         const redirect = encodeURIComponent(`${ipc.HUB_BASE_URL}/api/v1/auth/github/callback`);
         const urlRes = await fetchWithTimeout(
-          `${ipc.HUB_BASE_URL}/api/v1/auth/github/url?state=${loginCode}&redirect_uri=${redirect}`,
+          `${ipc.HUB_BASE_URL}/api/v1/auth/github/url?state=${loginCode}&redirect_uri=${redirect}&loopback_port=${loopbackPort}`,
           {},
           8000,
         );
@@ -241,66 +268,56 @@ export const SettingsModal: React.FC = () => {
         return;
       }
 
-      // Poll the hub until the browser login completes (max 5 minutes; the
-      // server keeps the pending login for 5 min too). The pickup_secret from
-      // the browser page is required by the hub (two-factor anti token-theft).
-      //
-      // AUTO-DETECT: halaman callback hub sudah auto-copy `pk_...` ke clipboard
-      // saat load. IDE membaca clipboard tiap iterasi — begitu user selesai
-      // authorize di GitHub, kode pickup langsung terbaca tanpa copas manual.
-      // Fallback: user bisa tetap paste manual ke kolom input.
-      const started = Date.now();
-      while (Date.now() - started < 300000) {
+      // Tunggu event pickup dari loopback (browser POST pk_ ke 127.0.0.1:port).
+      setNote('Menunggu browser mengirim kode pickup ke IDE (otomatis)…');
+      const secret = await pickupPromise;
+      if (!mountedRef.current) return;
+      if (!secret) {
+        setNote('Login timed out (5 menit). Coba lagi, atau pakai kolom manual di bawah.');
+        return;
+      }
+      pickupRef.current = secret;
+      setPickupCode(secret);
+
+      // Pickup code sudah ada → poll hub /auth/pending untuk ambil token.
+      const pollStarted = Date.now();
+      while (Date.now() - pollStarted < 60000) {
         if (!mountedRef.current) return;
-        await new Promise((r) => setTimeout(r, 1500));
-        // Auto-detect pickup code dari OS clipboard (native Tauri plugin,
-        // bukan navigator.clipboard yang diblok webview dev mode).
-        if (!pickupRef.current) {
-          try {
-            const clip = await invoke<string>('plugin:clipboard-manager|read_text');
-            const m = clip.match(/pk_[a-f0-9]{16,}/i);
-            if (m) {
-              pickupRef.current = m[0];
-              setPickupCode(m[0]);
-            }
-          } catch {
-            /* plugin belum siap — coba lagi iterasi berikutnya */
-          }
-        }
-        const secret = pickupRef.current.trim();
         try {
           const res = await fetchWithTimeout(
             `${ipc.HUB_BASE_URL}/api/v1/auth/pending?code=${loginCode}&pickup_secret=${encodeURIComponent(secret)}`,
             { cache: 'no-store' },
             8000,
           );
-          if (!res.ok) continue;
-          const auth = await res.json();
-          if (!auth?.token_key) continue;
-
-          // Persist into the file-backed credential store (reliable across rebuilds);
-          // the Rust side mirrors to the OS Keychain as a best-effort fallback.
-          await ipc.agentSaveHubCredentials(
-            auth.token_key,
-            auth.session_key,
-            auth.session_expires_at,
-            auth.email,
-            auth.plan_tier,
-          );
-          setHubToken(auth.token_key);
-          setNote(
-            `Signed in as ${auth.email} (${auth.plan_tier}) — connected automatically. Session key aktif 30 menit & auto-renew.`,
-          );
-          await checkKey();
-          setHubAccount(await ipc.agentHubAccount().catch(() => null));
-          await fetchUsage();
-          return;
+          if (res.ok) {
+            const auth = await res.json();
+            if (auth?.token_key) {
+              await ipc.agentSaveHubCredentials(
+                auth.token_key,
+                auth.session_key,
+                auth.session_expires_at,
+                auth.email,
+                auth.plan_tier,
+              );
+              setHubToken(auth.token_key);
+              setNote(
+                `Signed in as ${auth.email} (${auth.plan_tier}) — connected automatically. Session key aktif 30 menit & auto-renew.`,
+              );
+              await checkKey();
+              setHubAccount(await ipc.agentHubAccount().catch(() => null));
+              await fetchUsage();
+              return;
+            }
+          }
         } catch {
           /* hub briefly unreachable; keep polling */
         }
+        await new Promise((r) => setTimeout(r, 1500));
       }
-      setNote('Login timed out. Click "Sign in with GitHub" again or paste the token manually.');
+      setNote('Login timed out (pickup diterima tapi token tidak terambil). Coba lagi.');
     } finally {
+      if (unlisten) unlisten();
+      invoke('auth_stop_loopback').catch(() => {});
       setSigningIn(false);
     }
   };

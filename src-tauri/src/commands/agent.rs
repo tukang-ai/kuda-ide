@@ -82,6 +82,39 @@ pub fn agent_hub_sign_out(state: State<'_, AppState>) -> Result<()> {
     crate::agent::hub_session::clear_hub_credentials(&app_data_dir)
 }
 
+/// Spawn loopback HTTP server di 127.0.0.1 untuk OAuth handoff. Kembalikan port
+/// yang dipakai (frontend akan menyertakannya ke hub `/auth/github/url`).
+#[tauri::command]
+pub async fn auth_start_loopback(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<u16> {
+    // Shutdown instance lama kalau ada (mis. user klik login ulang).
+    {
+        let mut slot = state.auth_loopback.lock().await;
+        if let Some(mut srv) = slot.take() {
+            srv.shutdown().await;
+        }
+    }
+    let server = crate::gateway::auth_loopback::LoopbackServer::spawn(app)
+        .await
+        .map_err(|e| AppError::General(format!("Failed to start loopback: {e}")))?;
+    let port = server.port;
+    let mut slot = state.auth_loopback.lock().await;
+    *slot = Some(server);
+    Ok(port)
+}
+
+/// Shutdown loopback server (dipanggil setelah login selesai / gagal / timeout).
+#[tauri::command]
+pub async fn auth_stop_loopback(state: State<'_, AppState>) -> Result<()> {
+    let mut slot = state.auth_loopback.lock().await;
+    if let Some(mut srv) = slot.take() {
+        srv.shutdown().await;
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AgentRunResult {
     pub chat_session_id: String,

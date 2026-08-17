@@ -40,6 +40,9 @@ pub struct AppState {
     /// same id twice), so each bucket holds ALL of that id's flags — a new run
     /// never overwrites a sibling run's cancel handle.
     pub active_runs: Mutex<HashMap<String, Vec<CancelFlag>>>,
+    /// Loopback HTTP server untuk OAuth handoff (di-spin-up saat GitHub login
+    /// dimulai, di-shutdown setelah selesai). `None` = tidak aktif.
+    pub auth_loopback: tokio::sync::Mutex<Option<crate::gateway::auth_loopback::LoopbackServer>>,
 }
 
 impl Default for AppState {
@@ -64,6 +67,7 @@ impl AppState {
             plan_decisions: Arc::new(PlanDecisionRegistry::new()),
             direction_decisions: Arc::new(DirectionDecisionRegistry::new()),
             active_runs: Mutex::new(HashMap::new()),
+            auth_loopback: tokio::sync::Mutex::new(None),
         }
     }
 

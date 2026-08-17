@@ -16,7 +16,6 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState::new())
         .setup(|app| {
             tracing_subscriber::fmt()
@@ -73,6 +72,8 @@ pub fn run() {
             commands::agent::agent_has_hub_credentials,
             commands::agent::agent_hub_account,
             commands::agent::agent_hub_sign_out,
+            commands::agent::auth_start_loopback,
+            commands::agent::auth_stop_loopback,
             commands::agent::provider_list,
             commands::agent::provider_save,
             commands::agent::provider_delete,

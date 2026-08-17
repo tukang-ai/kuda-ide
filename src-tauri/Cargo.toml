@@ -8,7 +8,6 @@ rust-version = "1.80"
 # === Tauri Core ===
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
-tauri-plugin-clipboard-manager = "2"
 
 # === Async Runtime & Traits ===
 tokio = { version = "1", features = ["full"] }
