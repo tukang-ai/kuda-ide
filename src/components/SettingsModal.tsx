@@ -1,5 +1,4 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   KeyRound, Eye, EyeOff, X, Plus, Trash2, Save, Layers, Workflow, ShieldAlert, CheckCircle2,
   Sparkles, Github, Zap, Check, Activity, LogOut,
@@ -214,39 +213,34 @@ export const SettingsModal: React.FC = () => {
     setPickupCode('');
     pickupRef.current = '';
     setNote(
-      'Opening GitHub login… selesai authorize di browser, KudaIDE otomatis terhubung (loopback). Tidak perlu copas.',
+      'Membuka otorisasi GitHub… setelah selesai di browser, KudaIDE akan otomatis terhubung (PKCE).',
     );
-    const loginCode = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
 
-    // Start loopback HTTP server di 127.0.0.1 (anti-clipboard handoff).
-    let loopbackPort = 0;
+    // 1. Generate cryptographic PKCE verifier (32 bytes = 64 hex chars)
+    const randomBytes = crypto.getRandomValues(new Uint8Array(32));
+    const verifier = Array.from(randomBytes)
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+
+    // 2. Compute SHA-256 challenge
+    let challenge = '';
     try {
-      loopbackPort = await ipc.authStartLoopback();
-    } catch (e) {
-      setNote(`Gagal start loopback server: ${e}`);
-      setSigningIn(false);
-      return;
+      const hashBuffer = await crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(verifier),
+      );
+      challenge = Array.from(new Uint8Array(hashBuffer))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    } catch {
+      challenge = verifier;
     }
 
-    // Dual-Channel Handoff Detection:
-    // Channel 1: Listen event dari Tauri `auth:pickup`
-    // Channel 2: Active memory polling `ipc.authGetPickup()` setiap 400ms
-    let unlisten: UnlistenFn | null = null;
-    let eventPickup: string | null = null;
-
     try {
-      const unlistenPromise = listen<string>('auth:pickup', (ev) => {
-        if (ev.payload && /^pk_[a-f0-9]{16,}$/i.test(ev.payload)) {
-          eventPickup = ev.payload;
-        }
-      });
-      unlisten = await unlistenPromise.catch(() => null);
-
-      let canonicalCode = loginCode;
       try {
         const redirect = encodeURIComponent(`${ipc.HUB_BASE_URL}/api/v1/auth/github/callback`);
         const urlRes = await fetchWithTimeout(
-          `${ipc.HUB_BASE_URL}/api/v1/auth/github/url?state=${loginCode}&redirect_uri=${redirect}&loopback_port=${loopbackPort}`,
+          `${ipc.HUB_BASE_URL}/api/v1/auth/github/url?challenge=${encodeURIComponent(challenge)}&redirect_uri=${redirect}`,
           {},
           8000,
         );
@@ -260,49 +254,21 @@ export const SettingsModal: React.FC = () => {
           setNote('GitHub OAuth is not configured on the Hub Server.');
           return;
         }
-        if (data.code) {
-          canonicalCode = data.code;
-        }
         await ipc.openExternalUrl(data.url);
       } catch {
         setNote('Hub server unreachable. Pastikan hub online di kuda-ide.my.id.');
         return;
       }
 
-      // Tunggu event pickup dari loopback (browser kirim pk_ ke 127.0.0.1:port).
-      setNote('Menunggu browser mengirim kode pickup ke IDE (otomatis)…');
+      setNote('Menunggu otorisasi GitHub di browser selesai…');
 
-      // Loop Dual-Channel: pantau event ATAU baca memori Rust secara berkala
-      let secret: string | null = null;
-      const waitStart = Date.now();
-      while (Date.now() - waitStart < 300000 && mountedRef.current) {
-        if (eventPickup) {
-          secret = eventPickup;
-          break;
-        }
-        const memSecret = await ipc.authGetPickup().catch(() => null);
-        if (memSecret && /^pk_[a-f0-9]{16,}$/i.test(memSecret)) {
-          secret = memSecret;
-          break;
-        }
-        await new Promise((r) => setTimeout(r, 400));
-      }
-
-      if (!mountedRef.current) return;
-      if (!secret) {
-        setNote('Login timed out (5 menit). Coba lagi, atau pakai kolom manual di bawah.');
-        return;
-      }
-      pickupRef.current = secret;
-      setPickupCode(secret);
-
-      // Pickup code sudah ada → poll hub /auth/pending untuk ambil token.
+      // 3. Poll Hub Server secara langsung via HTTPS menggunakan PKCE verifier
       const pollStarted = Date.now();
-      while (Date.now() - pollStarted < 60000) {
+      while (Date.now() - pollStarted < 300000) {
         if (!mountedRef.current) return;
         try {
           const res = await fetchWithTimeout(
-            `${ipc.HUB_BASE_URL}/api/v1/auth/pending?code=${canonicalCode}&pickup_secret=${encodeURIComponent(secret)}`,
+            `${ipc.HUB_BASE_URL}/api/v1/auth/pending?verifier=${encodeURIComponent(verifier)}`,
             { cache: 'no-store' },
             8000,
           );
@@ -318,7 +284,7 @@ export const SettingsModal: React.FC = () => {
               );
               setHubToken(auth.token_key);
               setNote(
-                `Signed in as ${auth.email} (${auth.plan_tier}) — connected automatically. Session key aktif 30 menit & auto-renew.`,
+                `Signed in as ${auth.email} (${auth.plan_tier}) — connected automatically (PKCE). Session key aktif 30 menit & auto-renew.`,
               );
               await checkKey();
               setHubAccount(await ipc.agentHubAccount().catch(() => null));
@@ -331,10 +297,8 @@ export const SettingsModal: React.FC = () => {
         }
         await new Promise((r) => setTimeout(r, 1500));
       }
-      setNote('Login timed out (pickup diterima tapi token tidak terambil). Coba lagi.');
+      setNote('Login timed out (5 menit). Silakan coba lagi atau gunakan kolom manual di bawah.');
     } finally {
-      if (unlisten) unlisten();
-      ipc.authStopLoopback().catch(() => {});
       setSigningIn(false);
     }
   };
