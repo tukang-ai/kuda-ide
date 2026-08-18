@@ -934,18 +934,18 @@ export const SettingsModal: React.FC = () => {
                         name: 'Mini Coin Pack (🔥 3X Promo)',
                         price: 'Rp 10.000',
                         period: '/sekali beli',
-                        max_tokens_per_day: 3000000,
+                        max_tokens_per_day: 10000000,
                         max_requests_per_min: 60,
-                        features: ['🔥 1.500 Koin Booster (Bonus 3X)', 'Saldo Permanen Tidak Hangus', '~200 Sesi AI Penuh'],
+                        features: ['🔥 5.000 Koin Booster (Bonus 3X)', 'Saldo Permanen Tidak Hangus', '~700 Sesi AI Penuh'],
                       },
                       {
                         id: 'boost-med',
                         name: 'Medium Coin Pack (🔥 3X Promo)',
                         price: 'Rp 25.000',
                         period: '/sekali beli',
-                        max_tokens_per_day: 10000000,
+                        max_tokens_per_day: 25000000,
                         max_requests_per_min: 100,
-                        features: ['🔥 4.500 Koin Booster (Bonus 3X)', 'Saldo Permanen Tidak Hangus', '~600 Sesi AI Penuh'],
+                        features: ['🔥 12.500 Koin Booster (Bonus 3X)', 'Saldo Permanen Tidak Hangus', '~1.750 Sesi AI Penuh'],
                       },
                     ]
                 ).map((plan: any) => (
