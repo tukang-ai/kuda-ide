@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   KeyRound, Eye, EyeOff, X, Plus, Trash2, Save, Layers, Workflow, ShieldAlert, CheckCircle2,
-  Sparkles, Github, Zap, Check, Activity, LogOut, ExternalLink,
+  Sparkles, Github, Zap, Check, Activity, LogOut,
 } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
 import * as ipc from '../lib/ipc';
@@ -234,20 +234,6 @@ export const SettingsModal: React.FC = () => {
       }
     } catch (e) {
       setNote(`Server unreachable: ${e}`);
-    }
-  };
-
-  const openCheckout = async (planId: string, planName: string) => {
-    try {
-      setNote(`Menyiapkan pembayaran Midtrans Snap untuk ${planName}…`);
-      await ipc.agentCreateSnapCheckout(planId, planName);
-      setNote(`Membuka pembayaran resmi Midtrans Snap untuk ${planName}. Poin otomatis masuk setelah bayar!`);
-    } catch (err: any) {
-      // Fallback direct webview bila Rust command offline
-      const email = hubAccount?.email || '';
-      const fallbackUrl = `${ipc.HUB_BASE_URL}/checkout?account_id=${encodeURIComponent(email)}&package_id=${encodeURIComponent(planId)}&name=${encodeURIComponent(email.split('@')[0] || '')}`;
-      ipc.openExternalUrl(fallbackUrl).catch(() => window.open(fallbackUrl, '_blank'));
-      setNote(`Membuka halaman pembayaran: ${err?.message || err}`);
     }
   };
 
@@ -975,65 +961,47 @@ export const SettingsModal: React.FC = () => {
                         features: ['🔥 12.500 Koin Booster (Bonus 3X)', 'Saldo Permanen Tidak Hangus', '~1.750 Sesi AI Penuh'],
                       },
                     ]
-                ).map((plan: any) => {
-                  const isFree = plan.id === 'free';
-                  const isCurrent = (userUsage?.plan_tier?.toLowerCase() === plan.id.toLowerCase()) || (isFree && (!userUsage?.plan_tier || userUsage.plan_tier.toLowerCase() === 'free'));
+                ).map((plan: any) => (
+                  <div
+                    key={plan.id}
+                    className={`plan-card ${selectedPlan === plan.id ? 'active' : ''}`}
+                    onClick={() => setSelectedPlan(plan.id as any)}
+                  >
+                    {selectedPlan === plan.id && <span className="plan-badge-active">Active</span>}
+                    <div>
+                      <div className="plan-card-title">{plan.name}</div>
+                      <div className="plan-card-price">
+                        {plan.price} <span>{plan.period}</span>
+                      </div>
+                      <div className="plan-features-list">
+                        {plan.features.map((feat: string, i: number) => (
+                          <div key={i} className="plan-feature-item">
+                            <Check size={11} style={{ color: 'var(--accent-emerald)', flexShrink: 0 }} />
+                            <span>{feat}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
 
-                  return (
-                    <div
-                      key={plan.id}
-                      className={`plan-card ${isCurrent ? 'active' : ''}`}
-                      style={{ cursor: isFree ? 'default' : 'pointer' }}
-                      onClick={() => {
-                        if (!isFree) {
-                          openCheckout(plan.id, plan.name);
-                        }
+                    <button
+                      className={`plan-select-btn ${selectedPlan === plan.id ? 'active-btn' : ''}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        switchPlanTier(plan.id);
                       }}
                     >
-                      {isCurrent && <span className="plan-badge-active">Active Plan</span>}
-                      <div>
-                        <div className="plan-card-title">{plan.name}</div>
-                        <div className="plan-card-price">
-                          {plan.price} <span>{plan.period}</span>
-                        </div>
-                        <div className="plan-features-list">
-                          {plan.features.map((feat: string, i: number) => (
-                            <div key={i} className="plan-feature-item">
-                              <Check size={11} style={{ color: 'var(--accent-emerald)', flexShrink: 0 }} />
-                              <span>{feat}</span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-
-                      <button
-                        className={`plan-select-btn ${isCurrent ? 'active-btn' : ''}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          if (isFree) {
-                            if (!isCurrent) switchPlanTier('free');
-                          } else {
-                            openCheckout(plan.id, plan.name);
-                          }
-                        }}
-                      >
-                        {isFree ? (
-                          isCurrent ? (
-                            <>
-                              <Check size={12} /> Paket Aktif
-                            </>
-                          ) : (
-                            <>Pilih Free</>
-                          )
-                        ) : (
-                          <>
-                            <Zap size={12} /> Beli {plan.price} <ExternalLink size={11} style={{ marginLeft: 4 }} />
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  );
-                })}
+                      {selectedPlan === plan.id ? (
+                        <>
+                          <Check size={12} /> Current Plan
+                        </>
+                      ) : (
+                        <>
+                          <Zap size={12} /> Beli {plan.price}
+                        </>
+                      )}
+                    </button>
+                  </div>
+                ))}
               </div>
             </div>
           )}

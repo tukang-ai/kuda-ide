@@ -123,58 +123,6 @@ pub async fn agent_hub_user_usage(
     Ok(val)
 }
 
-/// Langsung membuat invoice Midtrans Snap dan membuka link pembayaran resmi Midtrans
-#[tauri::command]
-pub async fn agent_create_snap_checkout(
-    state: State<'_, AppState>,
-    package_id: String,
-    package_name: String,
-) -> Result<String> {
-    let app_data_dir = state.require_app_data_dir()?;
-    let creds = crate::agent::hub_session::HubCredentialStore::load(&app_data_dir);
-    let email = creds.map(|c| c.email).filter(|e| !e.is_empty()).unwrap_or_else(|| "dev@kuda.ide".to_string());
-    let customer_name = email.split('@').next().unwrap_or("Developer").to_string();
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| AppError::General(format!("Failed to build HTTP client: {e}")))?;
-
-    let base_url = crate::agent::provider_config::HUB_BASE_URL.trim_end_matches('/');
-    let url = format!("{}/payment/create-snap-invoice", base_url);
-
-    let payload = serde_json::json!({
-        "account_id": email,
-        "package_id": package_id,
-        "package_name": package_name,
-        "amount_idr": 0,
-        "customer_email": email,
-        "customer_name": customer_name
-    });
-
-    let resp = client.post(&url)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| AppError::General(format!("Gagal menghubungi gateway pembayaran: {e}")))?;
-
-    if !resp.status().is_success() {
-        return Err(AppError::General(format!("Gateway pembayaran error: HTTP {}", resp.status())));
-    }
-
-    let val: serde_json::Value = resp.json().await
-        .map_err(|e| AppError::General(format!("Format invoice tidak valid: {e}")))?;
-
-    let redirect_url = val.get("redirect_url")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::General("Link pembayaran tidak ditemukan".to_string()))?;
-
-    // Buka browser langsung ke halaman pembayaran resmi Midtrans Snap
-    let _ = crate::commands::project::open_external_url(redirect_url.to_string());
-
-    Ok(redirect_url.to_string())
-}
-
 /// Signs out of the hub: removes the file-backed credentials and keychain mirror.
 #[tauri::command]
 pub fn agent_hub_sign_out(state: State<'_, AppState>) -> Result<()> {
