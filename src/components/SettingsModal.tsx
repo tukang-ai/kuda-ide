@@ -905,7 +905,7 @@ export const SettingsModal: React.FC = () => {
 
               {/* Dynamic Plan Cards from Server */}
               <div style={{ fontSize: 12, fontWeight: 700, color: '#fff', marginBottom: 6 }}>
-                Available Subscription Plans (Loaded from Hub Server)
+                🪙 Pilihan Paket Koin / Top-Up Booster Kuda Point (Loaded from Hub Server)
               </div>
               <div className="subscription-cards-grid">
                 {(serverPlans.length > 0
@@ -914,29 +914,29 @@ export const SettingsModal: React.FC = () => {
                       {
                         id: 'free',
                         name: 'Free Developer Tier',
-                        price: '$0',
-                        period: '/month',
+                        price: 'Rp 0',
+                        period: '/welcome',
                         max_tokens_per_day: 1000000,
-                        max_requests_per_min: 20,
-                        features: ['1,000,000 Tokens / day (input)', '30,000 Tokens / request (output)', '20 Requests / min'],
+                        max_requests_per_min: 30,
+                        features: ['🎁 100 Poin Gratis Saat Mendaftar', 'Akses Penuh ke Semua Model', 'Context Caching Hemat 98%'],
                       },
                       {
-                        id: 'pro',
-                        name: 'Pro Developer Plan',
-                        price: '$10',
-                        period: '/month',
-                        max_tokens_per_day: 1000000,
-                        max_requests_per_min: 100,
-                        features: ['1,000,000 Tokens / day', '100 Requests / min', 'Gemini Pro & GPT-4o Access'],
+                        id: 'boost-mini',
+                        name: 'Mini Coin Pack (🔥 3X Promo)',
+                        price: 'Rp 10.000',
+                        period: '/sekali beli',
+                        max_tokens_per_day: 3000000,
+                        max_requests_per_min: 60,
+                        features: ['🔥 1.500 Koin Booster (Bonus 3X)', 'Saldo Permanen Tidak Hangus', '~200 Sesi AI Penuh'],
                       },
                       {
-                        id: 'developer',
-                        name: 'Enterprise Plan',
-                        price: '$29',
-                        period: '/month',
+                        id: 'boost-med',
+                        name: 'Medium Coin Pack (🔥 3X Promo)',
+                        price: 'Rp 25.000',
+                        period: '/sekali beli',
                         max_tokens_per_day: 10000000,
-                        max_requests_per_min: 500,
-                        features: ['10,000,000 Tokens / day', '500 Requests / min', 'Dedicated Proxy Access'],
+                        max_requests_per_min: 100,
+                        features: ['🔥 4.500 Koin Booster (Bonus 3X)', 'Saldo Permanen Tidak Hangus', '~600 Sesi AI Penuh'],
                       },
                     ]
                 ).map((plan: any) => (
@@ -974,7 +974,7 @@ export const SettingsModal: React.FC = () => {
                         </>
                       ) : (
                         <>
-                          <Zap size={12} /> Subscribe {plan.price}
+                          <Zap size={12} /> Beli {plan.price}
                         </>
                       )}
                     </button>
