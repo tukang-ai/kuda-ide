@@ -3,6 +3,7 @@ import {
   KeyRound, Eye, EyeOff, X, Plus, Trash2, Save, Layers, Workflow, ShieldAlert, CheckCircle2,
   Sparkles, Github, Zap, Check, Activity, LogOut,
 } from 'lucide-react';
+import { listen } from '@tauri-apps/api/event';
 import * as ipc from '../lib/ipc';
 import { useLayout } from '../store/layout';
 import { useAgent } from '../store/agent';
@@ -153,8 +154,21 @@ export const SettingsModal: React.FC = () => {
   const mountedRef = useRef(true);
 
   useEffect(() => {
+    const unlistenPromise = listen<ipc.HubAccount>('hub-auth-success', async (event) => {
+      if (event.payload?.logged_in) {
+        setHubAccount(event.payload);
+        setSigningIn(false);
+        setNote(
+          `Signed in as ${event.payload.email} (${event.payload.plan_tier}) — terhubung otomatis via Rust Engine.`,
+        );
+        await checkKey();
+        await fetchUsage();
+      }
+    });
+
     return () => {
       mountedRef.current = false;
+      unlistenPromise.then((unlisten) => unlisten());
     };
   }, []);
 
@@ -213,76 +227,16 @@ export const SettingsModal: React.FC = () => {
     setPickupCode('');
     pickupRef.current = '';
     setNote(
-      'Membuka otorisasi GitHub… setelah selesai di browser, KudaIDE akan otomatis terhubung (PKCE).',
+      'Membuka otorisasi GitHub di browser… setelah otorisasi selesai, KudaIDE akan otomatis terhubung.',
     );
 
-    // 1. Generate cryptographic PKCE verifier (32 bytes = 64 hex chars)
-    const randomBytes = crypto.getRandomValues(new Uint8Array(32));
-    const verifier = Array.from(randomBytes)
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join('');
-
-    // 2. Compute SHA-256 challenge
-    let challenge = '';
     try {
-      const hashBuffer = await crypto.subtle.digest(
-        'SHA-256',
-        new TextEncoder().encode(verifier),
+      await ipc.authStartGithubPkce();
+      setNote(
+        'Menunggu otorisasi GitHub di browser selesai… Rust background engine sedang memantau koneksi.',
       );
-      challenge = Array.from(new Uint8Array(hashBuffer))
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('');
-    } catch {
-      challenge = verifier;
-    }
-
-    try {
-      try {
-        const redirect = encodeURIComponent(`${ipc.HUB_BASE_URL}/api/v1/auth/github/callback`);
-        const urlRes = await fetchWithTimeout(
-          `${ipc.HUB_BASE_URL}/api/v1/auth/github/url?challenge=${encodeURIComponent(challenge)}&redirect_uri=${redirect}`,
-          {},
-          8000,
-        );
-        if (!urlRes.ok) {
-          const err = await urlRes.json().catch(() => ({}));
-          setNote(`GitHub OAuth error: ${err.error || urlRes.status}`);
-          return;
-        }
-        const data = await urlRes.json();
-        if (!data.url) {
-          setNote('GitHub OAuth is not configured on the Hub Server.');
-          return;
-        }
-        await ipc.openExternalUrl(data.url);
-      } catch {
-        setNote('Hub server unreachable. Pastikan hub online di kuda-ide.my.id.');
-        return;
-      }
-
-      setNote('Menunggu otorisasi GitHub di browser selesai…');
-
-      // 3. Poll Hub Server langsung via Rust IPC (kebal CORS, langsung persist ke disk di Rust)
-      const pollStarted = Date.now();
-      while (Date.now() - pollStarted < 300000 && mountedRef.current) {
-        try {
-          const account = await ipc.agentPollHubLogin(verifier);
-          if (account && account.logged_in) {
-            setHubAccount(account);
-            setNote(
-              `Signed in as ${account.email} (${account.plan_tier}) — connected automatically. Session key aktif 30 menit & auto-renew.`,
-            );
-            await checkKey();
-            await fetchUsage();
-            return;
-          }
-        } catch {
-          /* pending authorization; keep polling */
-        }
-        await new Promise((r) => setTimeout(r, 1500));
-      }
-      setNote('Login timed out (5 menit). Silakan coba lagi atau gunakan kolom manual di bawah.');
-    } finally {
+    } catch (err: any) {
+      setNote(`Gagal memulai login GitHub: ${err?.message || err}`);
       setSigningIn(false);
     }
   };

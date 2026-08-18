@@ -1,5 +1,6 @@
 use tauri::ipc::Channel;
-use tauri::State;use crate::agent::chat_history::{ChatHistoryManager, ChatSessionData, ChatSessionMeta};
+use tauri::{Emitter, State};
+use crate::agent::chat_history::{ChatHistoryManager, ChatSessionData, ChatSessionMeta};
 use crate::agent::key_store::KeyStore;
 use crate::agent::llm_client::{Message, MessageRole};
 use crate::agent::orchestrator::{AgentEvent, AgentOrchestrator};
@@ -11,6 +12,8 @@ use crate::error::{AppError, Result};
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use sha2::{Digest, Sha256};
+use rand::RngCore;
 
 #[tauri::command]
 pub fn agent_save_key(provider: String, api_key: String) -> Result<()> {
@@ -133,6 +136,110 @@ pub async fn agent_poll_hub_login(
         plan_tier: auth.plan_tier,
         session_expires_at: auth.session_expires_at,
     })
+}
+
+/// Inisiasi OAuth GitHub PKCE 100% dari Rust Engine:
+/// 1. Rust membuat CSPRNG random verifier (32-byte) & challenge (SHA-256).
+/// 2. Rust meminta URL OAuth ke Hub Server dan membuka browser via open_external_url.
+/// 3. Rust menjalankan background Tokio task yang terus mem-poll Hub Server (kebal unmount/blur di UI).
+/// 4. Saat otorisasi selesai, Rust menulis `hub_credentials.json` ke disk dan memancarkan event `hub-auth-success`.
+#[tauri::command]
+pub async fn auth_start_github_pkce(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let app_data_dir = state.require_app_data_dir()?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| AppError::General(format!("HTTP client error: {e}")))?;
+
+    // 1. Generate 32-byte cryptographic random verifier & SHA-256 challenge in Rust
+    let mut rng = rand::rngs::OsRng;
+    let mut verifier_bytes = [0u8; 32];
+    rng.fill_bytes(&mut verifier_bytes);
+    let verifier = verifier_bytes
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
+
+    let mut hasher = Sha256::new();
+    hasher.update(verifier.as_bytes());
+    let challenge = format!("{:x}", hasher.finalize());
+
+    // 2. Request GitHub OAuth URL from Hub Server
+    let base_url = crate::agent::provider_config::HUB_BASE_URL.trim_end_matches('/');
+    let redirect_uri = format!("{}/auth/github/callback", base_url);
+    let redirect_enc = redirect_uri.replace(":", "%3A").replace("/", "%2F");
+    let hub_url = format!(
+        "{}/auth/github/url?challenge={}&redirect_uri={}",
+        base_url, challenge, redirect_enc
+    );
+
+    let resp = client.get(&hub_url).send().await
+        .map_err(|e| AppError::General(format!("Gagal menghubungi Hub Server: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(AppError::General(format!("Hub server error (HTTP {})", resp.status())));
+    }
+
+    #[derive(Deserialize)]
+    struct HubUrlResp {
+        url: String,
+    }
+    let data: HubUrlResp = resp.json().await
+        .map_err(|e| AppError::General(format!("Format respon Hub tidak valid: {e}")))?;
+
+    if data.url.is_empty() {
+        return Err(AppError::General("Hub tidak mengembalikan URL OAuth GitHub".to_string()));
+    }
+
+    // 3. Open browser from Rust
+    let _ = crate::commands::project::open_external_url(data.url);
+
+    // 4. Spawn autonomous Tokio task in Rust
+    let poll_client = client.clone();
+    let poll_url = format!("{}/auth/pending?verifier={}", base_url, verifier);
+    let app_handle = app.clone();
+
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let max_duration = std::time::Duration::from_secs(300); // 5 menit
+
+        while started.elapsed() < max_duration {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+            if let Ok(resp) = poll_client.get(&poll_url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(auth) = resp.json::<crate::agent::hub_session::HubSessionInfo>().await {
+                        if !auth.token_key.is_empty() {
+                            // Simpan langsung ke disk di Rust
+                            let _ = crate::agent::hub_session::save_hub_credentials(
+                                &app_data_dir,
+                                &auth.token_key,
+                                &auth.session_key,
+                                &auth.session_expires_at,
+                                &auth.email,
+                                &auth.plan_tier,
+                            );
+
+                            // Emit event ke seluruh UI KudaIDE
+                            let account = crate::agent::hub_session::HubAccountInfo {
+                                logged_in: true,
+                                email: auth.email,
+                                plan_tier: auth.plan_tier,
+                                session_expires_at: auth.session_expires_at,
+                            };
+                            let _ = app_handle.emit("hub-auth-success", account);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(())
 }
 
 /// Spawn loopback HTTP server di 127.0.0.1 untuk OAuth handoff. Kembalikan port

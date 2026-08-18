@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { Channel } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import * as ipc from '../lib/ipc';
 import type { AgentEvent, AgentRoleKey, ChatMessage, ChatSessionMeta, PhaseRecord } from '../types';
 import { StreamTextBuffer, type FlushedText } from './streamBuffer';
@@ -183,6 +184,12 @@ export const useAgent = create<AgentState>((set, get) => ({
 
   init: async () => {
     await get().checkKey();
+    listen<ipc.HubAccount>('hub-auth-success', (event) => {
+      if (event.payload?.logged_in) {
+        set({ hasHubKey: true });
+        get().checkKey();
+      }
+    }).catch(() => {});
     // Re-probe once shortly after startup: the very first IPC invoke can race
     // webview initialization, which used to leave the badge red until the user
     // happened to open Settings (which triggers another checkKey).

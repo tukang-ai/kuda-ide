@@ -230,6 +230,9 @@ export const agentHubSignOut = (): Promise<void> =>
 export const agentPollHubLogin = (verifier: string): Promise<HubAccount> =>
   invoke<HubAccount>('agent_poll_hub_login', { verifier });
 
+export const authStartGithubPkce = (): Promise<void> =>
+  invoke<void>('auth_start_github_pkce');
+
 export const authStartLoopback = (): Promise<number> =>
   invoke<number>('auth_start_loopback');
 
