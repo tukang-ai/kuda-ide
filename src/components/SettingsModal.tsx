@@ -927,7 +927,7 @@ export const SettingsModal: React.FC = () => {
                         period: '/welcome',
                         max_tokens_per_day: 1000000,
                         max_requests_per_min: 30,
-                        features: ['🎁 100 Poin Gratis Saat Mendaftar', 'Akses Penuh ke Semua Model', 'Context Caching Hemat 98%'],
+                        features: ['🎁 250 Poin Gratis Saat Mendaftar', 'Akses Penuh ke Semua Model', 'Context Caching Hemat 98%'],
                       },
                       {
                         id: 'boost-mini',
