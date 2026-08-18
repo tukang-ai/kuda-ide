@@ -847,9 +847,6 @@ export const SettingsModal: React.FC = () => {
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 13 }}>
                     <div style={{ color: '#e5e7eb' }}>
                       Signed in as <strong style={{ color: '#fff' }}>{hubAccount.email}</strong>
-                      <span style={{ marginLeft: 8, textTransform: 'uppercase', fontSize: 11, fontWeight: 700, color: 'var(--accent)' }}>
-                        {hubAccount.plan_tier} plan
-                      </span>
                     </div>
                     <div className="text-muted" style={{ fontSize: 12 }}>
                       Session key aktif s/d{' '}
@@ -952,7 +949,7 @@ export const SettingsModal: React.FC = () => {
                   <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                     <Activity size={13} style={{ color: 'var(--accent)' }} /> Saldo Poin & Kuota Harian
                   </span>
-                  <span>Active Plan: <strong style={{ color: 'var(--accent)', textTransform: 'uppercase' }}>{userUsage?.plan_tier || selectedPlan}</strong></span>
+                  <span>Status Akun: <strong style={{ color: 'var(--accent-emerald)' }}>AKTIF & TERHUBUNG</strong></span>
                 </div>
                 <div className="quota-progress-track" style={{ marginTop: 8 }}>
                   <div
