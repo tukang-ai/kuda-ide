@@ -121,6 +121,8 @@ export const SettingsModal: React.FC = () => {
     requests_today: number;
     points_today: number;
     points_remaining_today: number;
+    booster_points_balance?: number;
+    total_points_available?: number;
   } | null>(null);
   const [serverPlans, setServerPlans] = useState<Array<{
     id: string;
@@ -874,11 +876,11 @@ export const SettingsModal: React.FC = () => {
               <div style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border-subtle)', borderRadius: 10, padding: 12, marginBottom: 14 }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 12, fontWeight: 700, color: '#fff' }}>
                   <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <Activity size={13} style={{ color: 'var(--accent)' }} /> Today's Quota Consumption
+                    <Activity size={13} style={{ color: 'var(--accent)' }} /> Saldo Poin & Kuota Harian
                   </span>
                   <span>Active Plan: <strong style={{ color: 'var(--accent)', textTransform: 'uppercase' }}>{userUsage?.plan_tier || selectedPlan}</strong></span>
                 </div>
-                <div className="quota-progress-track">
+                <div className="quota-progress-track" style={{ marginTop: 8 }}>
                   <div
                     className="quota-progress-fill"
                     style={{
@@ -886,20 +888,27 @@ export const SettingsModal: React.FC = () => {
                         100,
                         Math.round(
                           ((userUsage?.points_today || 0) /
-                            ((userUsage?.points_today || 0) + (userUsage?.points_remaining_today || 200))) *
+                            Math.max(1, (userUsage?.points_today || 0) + (userUsage?.total_points_available ?? userUsage?.points_remaining_today ?? 100))) *
                             100
                         )
                       )}%`,
                     }}
                   />
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 11, color: 'var(--text-secondary)' }}>
-                  <span>{(userUsage?.points_today || 0).toLocaleString()} Points Used Today</span>
-                  <span>Remaining: {(userUsage?.points_remaining_today ?? 0).toLocaleString()} Points</span>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 11, color: 'var(--text-secondary)', marginTop: 4 }}>
+                  <span>{(userUsage?.points_today || 0).toLocaleString()} Points Terpakai Hari Ini</span>
+                  <span style={{ color: '#fff', fontWeight: 600 }}>
+                    Sisa Tersedia: {(userUsage?.total_points_available ?? userUsage?.points_remaining_today ?? 0).toLocaleString()} Poin
+                    {(userUsage?.booster_points_balance || 0) > 0 && (
+                      <span style={{ color: 'var(--accent-emerald)', marginLeft: 4 }}>
+                        (+{(userUsage?.booster_points_balance || 0).toLocaleString()} Booster)
+                      </span>
+                    )}
+                  </span>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 11, color: 'var(--text-secondary)', marginTop: 4 }}>
-                  <span>{(userUsage?.tokens_today || 0).toLocaleString()} Tokens Used Today</span>
-                  <span>Each request deducts the model's point price</span>
+                  <span>{(userUsage?.tokens_today || 0).toLocaleString()} Tokens Terpakai Hari Ini</span>
+                  <span>Deduksi otomatis per model (hemat koin)</span>
                 </div>
               </div>
 
