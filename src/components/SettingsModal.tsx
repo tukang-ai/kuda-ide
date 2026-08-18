@@ -211,6 +211,53 @@ export const SettingsModal: React.FC = () => {
     }
   };
 
+  const [buyingPackageId, setBuyingPackageId] = useState<string | null>(null);
+
+  const buyBoosterPackage = async (plan: { id: string; name: string; price: string }) => {
+    const email = hubAccount?.email;
+    if (!email) {
+      setNote('Silakan hubungkan akun GitHub Anda terlebih dahulu untuk top-up.');
+      return;
+    }
+    setBuyingPackageId(plan.id);
+    setNote(`Membuat invoice Midtrans untuk ${plan.name}…`);
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (hubToken) headers['Authorization'] = `Bearer ${hubToken}`;
+      const res = await fetchWithTimeout(
+        `${ipc.HUB_BASE_URL}/api/v1/payment/invoice`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            account_id: email,
+            customer_email: email,
+            customer_name: email.split('@')[0],
+            package_id: plan.id,
+            package_name: plan.name,
+          }),
+        },
+        10000,
+      );
+      if (res.ok) {
+        const data = await res.json();
+        if (data.snap_redirect_url) {
+          setNote(`Membuka pembayaran Midtrans (${plan.name}) di browser…`);
+          await ipc.openExternalUrl(data.snap_redirect_url);
+        } else {
+          setNote(`Invoice dibuat, Order ID: ${data.order_id}`);
+        }
+      } else {
+        const err = await res.json().catch(() => ({}));
+        setNote(`Gagal membuat invoice: ${err.error || 'Terjadi kesalahan'}`);
+      }
+    } catch (e) {
+      setNote(`Gagal menghubungi server: ${e}`);
+    } finally {
+      setBuyingPackageId(null);
+    }
+  };
+
   const switchPlanTier = async (newPlan: string) => {
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -927,47 +974,45 @@ export const SettingsModal: React.FC = () => {
 
               {/* Dynamic Plan Cards from Server */}
               <div style={{ fontSize: 12, fontWeight: 700, color: '#fff', marginBottom: 6 }}>
-                🪙 Pilihan Paket Koin / Top-Up Booster Kuda Point (Loaded from Hub Server)
+                🪙 Pilihan Paket Top-Up Koin Booster (Buka Pembayaran Midtrans Langsung)
               </div>
               <div className="subscription-cards-grid">
                 {(serverPlans.length > 0
-                  ? serverPlans
+                  ? serverPlans.filter((p: any) => p.id !== 'free')
                   : [
                       {
-                        id: 'free',
-                        name: 'Free Developer Tier',
-                        price: 'Rp 0',
-                        period: '/welcome',
-                        max_tokens_per_day: 1000000,
-                        max_requests_per_min: 30,
-                        features: ['🎁 250 Poin Gratis Saat Mendaftar', 'Akses Penuh ke Semua Model', 'Context Caching Hemat 98%'],
-                      },
-                      {
                         id: 'boost-mini',
-                        name: 'Mini Coin Pack (🔥 3X Promo)',
+                        name: 'Booster Mini (🔥 5X Promo)',
                         price: 'Rp 10.000',
                         period: '/sekali beli',
                         max_tokens_per_day: 10000000,
                         max_requests_per_min: 60,
-                        features: ['🔥 5.000 Koin Booster (Bonus 3X)', 'Saldo Permanen Tidak Hangus', '~700 Sesi AI Penuh'],
+                        features: ['🔥 1.500 Poin Saldo Langsung', 'Saldo Permanen Tidak Hangus', 'Bebas Pilih Semua Model'],
                       },
                       {
                         id: 'boost-med',
-                        name: 'Medium Coin Pack (🔥 3X Promo)',
+                        name: 'Booster Medium (🔥 5X Promo)',
                         price: 'Rp 25.000',
                         period: '/sekali beli',
                         max_tokens_per_day: 25000000,
                         max_requests_per_min: 100,
-                        features: ['🔥 12.500 Koin Booster (Bonus 3X)', 'Saldo Permanen Tidak Hangus', '~1.750 Sesi AI Penuh'],
+                        features: ['🔥 4.000 Poin Saldo Langsung', 'Saldo Permanen Tidak Hangus', 'Prioritas Antrian Eksekusi'],
+                      },
+                      {
+                        id: 'boost-jumbo',
+                        name: 'Booster Jumbo (🔥 5X Promo)',
+                        price: 'Rp 50.000',
+                        period: '/sekali beli',
+                        max_tokens_per_day: 50000000,
+                        max_requests_per_min: 200,
+                        features: ['🔥 9.000 Poin Saldo Langsung', 'Saldo Permanen Tidak Hangus', 'High-Throughput Gateway'],
                       },
                     ]
                 ).map((plan: any) => (
                   <div
                     key={plan.id}
-                    className={`plan-card ${selectedPlan === plan.id ? 'active' : ''}`}
-                    onClick={() => setSelectedPlan(plan.id as any)}
+                    className="plan-card"
                   >
-                    {selectedPlan === plan.id && <span className="plan-badge-active">Active</span>}
                     <div>
                       <div className="plan-card-title">{plan.name}</div>
                       <div className="plan-card-price">
@@ -984,19 +1029,24 @@ export const SettingsModal: React.FC = () => {
                     </div>
 
                     <button
-                      className={`plan-select-btn ${selectedPlan === plan.id ? 'active-btn' : ''}`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        switchPlanTier(plan.id);
+                      className="plan-select-btn"
+                      disabled={buyingPackageId === plan.id}
+                      onClick={() => buyBoosterPackage(plan)}
+                      style={{
+                        background: 'linear-gradient(135deg, #10b981, #059669)',
+                        color: '#ffffff',
+                        fontWeight: 700,
+                        border: 'none',
+                        marginTop: 14,
+                        cursor: buyingPackageId === plan.id ? 'not-allowed' : 'pointer',
+                        opacity: buyingPackageId === plan.id ? 0.7 : 1,
                       }}
                     >
-                      {selectedPlan === plan.id ? (
-                        <>
-                          <Check size={12} /> Current Plan
-                        </>
+                      {buyingPackageId === plan.id ? (
+                        <>Memproses Midtrans…</>
                       ) : (
                         <>
-                          <Zap size={12} /> Beli {plan.price}
+                          <Zap size={12} /> Top-Up {plan.price}
                         </>
                       )}
                     </button>
