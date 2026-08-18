@@ -237,13 +237,18 @@ export const SettingsModal: React.FC = () => {
     }
   };
 
-  const openCheckout = (planId: string, planName: string) => {
-    const email = hubAccount?.email || '';
-    const checkoutUrl = `${ipc.HUB_BASE_URL}/checkout?account_id=${encodeURIComponent(email)}&package_id=${encodeURIComponent(planId)}&name=${encodeURIComponent(email.split('@')[0] || '')}`;
-    setNote(`Membuka halaman pembayaran Midtrans Snap di browser untuk ${planName}…`);
-    ipc.openExternalUrl(checkoutUrl).catch(() => {
-      window.open(checkoutUrl, '_blank');
-    });
+  const openCheckout = async (planId: string, planName: string) => {
+    try {
+      setNote(`Menyiapkan pembayaran Midtrans Snap untuk ${planName}…`);
+      await ipc.agentCreateSnapCheckout(planId, planName);
+      setNote(`Membuka pembayaran resmi Midtrans Snap untuk ${planName}. Poin otomatis masuk setelah bayar!`);
+    } catch (err: any) {
+      // Fallback direct webview bila Rust command offline
+      const email = hubAccount?.email || '';
+      const fallbackUrl = `${ipc.HUB_BASE_URL}/checkout?account_id=${encodeURIComponent(email)}&package_id=${encodeURIComponent(planId)}&name=${encodeURIComponent(email.split('@')[0] || '')}`;
+      ipc.openExternalUrl(fallbackUrl).catch(() => window.open(fallbackUrl, '_blank'));
+      setNote(`Membuka halaman pembayaran: ${err?.message || err}`);
+    }
   };
 
   const signInWithGithub = async () => {

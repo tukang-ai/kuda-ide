@@ -227,6 +227,9 @@ export const agentHubAccount = (): Promise<HubAccount> =>
 export const agentHubUserUsage = (): Promise<any> =>
   invoke<any>('agent_hub_user_usage');
 
+export const agentCreateSnapCheckout = (package_id: string, package_name: string): Promise<string> =>
+  invoke<string>('agent_create_snap_checkout', { packageId: package_id, packageName: package_name });
+
 export const agentHubSignOut = (): Promise<void> =>
   invoke<void>('agent_hub_sign_out');
 
