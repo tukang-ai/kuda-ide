@@ -214,11 +214,24 @@ export const SettingsModal: React.FC = () => {
   const [buyingPackageId, setBuyingPackageId] = useState<string | null>(null);
 
   const buyBoosterPackage = async (plan: { id: string; name: string; price: string }) => {
-    const email = hubAccount?.email;
+    // Ambil email dari hubAccount atau fallback ke userUsage/localStorage
+    let email = hubAccount?.email;
     if (!email) {
-      setNote('Silakan hubungkan akun GitHub Anda terlebih dahulu untuk top-up.');
-      return;
+      try {
+        const acc = await ipc.agentHubAccount();
+        if (acc?.email) email = acc.email;
+      } catch {
+        /* ignore */
+      }
     }
+    if (!email && userUsage?.user_id && userUsage.user_id.includes('@')) {
+      email = userUsage.user_id;
+    }
+    if (!email) {
+      email = 'dev@kuda.ide';
+    }
+
+    const amountNum = parseInt(plan.price.replace(/[^0-9]/g, ''), 10) || 10000;
     setBuyingPackageId(plan.id);
     setNote(`Membuat invoice Midtrans untuk ${plan.name}…`);
     try {
@@ -235,6 +248,7 @@ export const SettingsModal: React.FC = () => {
             customer_name: email.split('@')[0],
             package_id: plan.id,
             package_name: plan.name,
+            amount_idr: amountNum,
           }),
         },
         10000,
