@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   KeyRound, Eye, EyeOff, X, Plus, Trash2, Save, Layers, Workflow, ShieldAlert, CheckCircle2,
-  Sparkles, Github, Zap, Check, Activity, LogOut,
+  Sparkles, Github, Zap, Check, Activity, LogOut, ExternalLink,
 } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
 import * as ipc from '../lib/ipc';
@@ -185,6 +185,19 @@ export const SettingsModal: React.FC = () => {
 
   const fetchUsage = async () => {
     try {
+      // 1. Coba ambil usage terautentikasi langsung lewat backend Rust
+      try {
+        const usageData = await ipc.agentHubUserUsage();
+        if (usageData && !usageData.error) {
+          setUserUsage(usageData);
+          if (usageData.plan_tier) setSelectedPlan(usageData.plan_tier.toLowerCase() as any);
+          return;
+        }
+      } catch {
+        /* fallback to direct webview fetch */
+      }
+
+      // 2. Fallback direct webview fetch
       const headers: Record<string, string> = {};
       if (hubToken) headers['Authorization'] = `Bearer ${hubToken}`;
       const res = await fetchWithTimeout(`${ipc.HUB_BASE_URL}/api/v1/user/usage`, { headers }, 4000);
@@ -222,6 +235,15 @@ export const SettingsModal: React.FC = () => {
     } catch (e) {
       setNote(`Server unreachable: ${e}`);
     }
+  };
+
+  const openCheckout = (planId: string, planName: string) => {
+    const email = hubAccount?.email || '';
+    const checkoutUrl = `${ipc.HUB_BASE_URL}/checkout?account_id=${encodeURIComponent(email)}&package_id=${encodeURIComponent(planId)}&name=${encodeURIComponent(email.split('@')[0] || '')}`;
+    setNote(`Membuka halaman pembayaran Midtrans Snap di browser untuk ${planName}…`);
+    ipc.openExternalUrl(checkoutUrl).catch(() => {
+      window.open(checkoutUrl, '_blank');
+    });
   };
 
   const signInWithGithub = async () => {
@@ -948,47 +970,65 @@ export const SettingsModal: React.FC = () => {
                         features: ['🔥 12.500 Koin Booster (Bonus 3X)', 'Saldo Permanen Tidak Hangus', '~1.750 Sesi AI Penuh'],
                       },
                     ]
-                ).map((plan: any) => (
-                  <div
-                    key={plan.id}
-                    className={`plan-card ${selectedPlan === plan.id ? 'active' : ''}`}
-                    onClick={() => setSelectedPlan(plan.id as any)}
-                  >
-                    {selectedPlan === plan.id && <span className="plan-badge-active">Active</span>}
-                    <div>
-                      <div className="plan-card-title">{plan.name}</div>
-                      <div className="plan-card-price">
-                        {plan.price} <span>{plan.period}</span>
-                      </div>
-                      <div className="plan-features-list">
-                        {plan.features.map((feat: string, i: number) => (
-                          <div key={i} className="plan-feature-item">
-                            <Check size={11} style={{ color: 'var(--accent-emerald)', flexShrink: 0 }} />
-                            <span>{feat}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
+                ).map((plan: any) => {
+                  const isFree = plan.id === 'free';
+                  const isCurrent = (userUsage?.plan_tier?.toLowerCase() === plan.id.toLowerCase()) || (isFree && (!userUsage?.plan_tier || userUsage.plan_tier.toLowerCase() === 'free'));
 
-                    <button
-                      className={`plan-select-btn ${selectedPlan === plan.id ? 'active-btn' : ''}`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        switchPlanTier(plan.id);
+                  return (
+                    <div
+                      key={plan.id}
+                      className={`plan-card ${isCurrent ? 'active' : ''}`}
+                      style={{ cursor: isFree ? 'default' : 'pointer' }}
+                      onClick={() => {
+                        if (!isFree) {
+                          openCheckout(plan.id, plan.name);
+                        }
                       }}
                     >
-                      {selectedPlan === plan.id ? (
-                        <>
-                          <Check size={12} /> Current Plan
-                        </>
-                      ) : (
-                        <>
-                          <Zap size={12} /> Beli {plan.price}
-                        </>
-                      )}
-                    </button>
-                  </div>
-                ))}
+                      {isCurrent && <span className="plan-badge-active">Active Plan</span>}
+                      <div>
+                        <div className="plan-card-title">{plan.name}</div>
+                        <div className="plan-card-price">
+                          {plan.price} <span>{plan.period}</span>
+                        </div>
+                        <div className="plan-features-list">
+                          {plan.features.map((feat: string, i: number) => (
+                            <div key={i} className="plan-feature-item">
+                              <Check size={11} style={{ color: 'var(--accent-emerald)', flexShrink: 0 }} />
+                              <span>{feat}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      <button
+                        className={`plan-select-btn ${isCurrent ? 'active-btn' : ''}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (isFree) {
+                            if (!isCurrent) switchPlanTier('free');
+                          } else {
+                            openCheckout(plan.id, plan.name);
+                          }
+                        }}
+                      >
+                        {isFree ? (
+                          isCurrent ? (
+                            <>
+                              <Check size={12} /> Paket Aktif
+                            </>
+                          ) : (
+                            <>Pilih Free</>
+                          )
+                        ) : (
+                          <>
+                            <Zap size={12} /> Beli {plan.price} <ExternalLink size={11} style={{ marginLeft: 4 }} />
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}

@@ -224,6 +224,9 @@ export interface HubAccount {
 export const agentHubAccount = (): Promise<HubAccount> =>
   invoke<HubAccount>('agent_hub_account');
 
+export const agentHubUserUsage = (): Promise<any> =>
+  invoke<any>('agent_hub_user_usage');
+
 export const agentHubSignOut = (): Promise<void> =>
   invoke<void>('agent_hub_sign_out');
 

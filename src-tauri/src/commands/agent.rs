@@ -71,11 +71,56 @@ pub fn agent_has_hub_credentials(state: State<'_, AppState>) -> Result<bool> {
 }
 
 /// Non-network hub account snapshot (email / plan / session expiry) for the
-/// Settings "connected" state.
+/// Settings "connected" state, automatically ensuring session freshness.
 #[tauri::command]
-pub fn agent_hub_account(state: State<'_, AppState>) -> Result<crate::agent::hub_session::HubAccountInfo> {
+pub async fn agent_hub_account(state: State<'_, AppState>) -> Result<crate::agent::hub_session::HubAccountInfo> {
     let app_data_dir = state.require_app_data_dir()?;
+    let _ = crate::agent::hub_session::ensure_hub_session(&app_data_dir).await;
     Ok(crate::agent::hub_session::hub_account(&app_data_dir))
+}
+
+/// Mengambil data kuota & saldo koin user dari Hub Server secara terautentikasi
+/// menggunakan master token / session key yang tersimpan di backend Rust.
+#[tauri::command]
+pub async fn agent_hub_user_usage(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value> {
+    let app_data_dir = state.require_app_data_dir()?;
+    let _ = crate::agent::hub_session::ensure_hub_session(&app_data_dir).await;
+    let creds = crate::agent::hub_session::HubCredentialStore::load(&app_data_dir)
+        .ok_or_else(|| AppError::General("Not logged in to Kuda Hub".to_string()))?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| AppError::General(format!("Failed to build HTTP client: {e}")))?;
+
+    let base_url = crate::agent::provider_config::HUB_BASE_URL.trim_end_matches('/');
+    let url = format!("{}/user/usage", base_url);
+
+    let token = if !creds.master_token.is_empty() {
+        &creds.master_token
+    } else {
+        &creds.session_key
+    };
+
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| AppError::General(format!("Hub network error: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(AppError::General(format!("Hub returned status {}", resp.status())));
+    }
+
+    let val: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| AppError::General(format!("Failed to parse usage response: {e}")))?;
+
+    Ok(val)
 }
 
 /// Signs out of the hub: removes the file-backed credentials and keychain mirror.
