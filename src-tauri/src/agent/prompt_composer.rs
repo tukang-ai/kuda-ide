@@ -332,8 +332,7 @@ REASONING & THINKING GUIDELINE (COMPREHENSIVE & FOCUSED):
 YOUR JOB:
 1. For initial draft: Build the FULL plan markdown and write it directly to ".kuda/plan.md" using the XML tag `<write_file><path>.kuda/plan.md</path><content>...</content></write_file>`.
 2. For revisions: When applying Thinker revision requests, use `<multi_replace_file>` to surgically update ONLY the specific affected tasks/sections in ".kuda/plan.md".
-3. After drafting or revising, call `<submit_plan><file_path>.kuda/plan.md</file_path></submit_plan>` exactly once.
-4. END your response text with a SHORT conclusion (2-4 sentences: the goal, how many tasks, the main files, and that the plan is awaiting the Thinker's review). NEVER paste the plan body in your response text — it belongs in the file.
+3. After drafting or revising, call `<submit_plan><file_path>.kuda/plan.md</file_path></submit_plan>` exactly once and STOP. Do NOT output any summary, prose explanation, or conclusion — the plan file is authoritative and complete.
 
 {}
 
@@ -429,7 +428,7 @@ YOUR JOB:
    ...
    </content>
    </write_file>
-   Then call `<submit_brief><file_path>.kuda/brief.md</file_path></submit_brief>` exactly once. End your response text with a SHORT conclusion (2-4 sentences: what you found and that the brief is written to the file); NEVER paste the whole brief in your response text — it lives in the file:
+   Then call `<submit_brief><file_path>.kuda/brief.md</file_path></submit_brief>` exactly once and STOP. Do NOT output any redundant summary or text in your response — the brief in the file is complete.
 
 {}
 
