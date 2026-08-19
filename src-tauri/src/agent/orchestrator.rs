@@ -70,6 +70,7 @@ fn is_transient_llm_error(err: &AppError) -> bool {
         || msg.contains("sse error")
         || msg.contains("stream error")
         || msg.contains("broken pipe")
+        || msg.contains("origin-close")
 }
 
 /// Extracts a provider-suggested retry delay ("Try again in 5 seconds" or
