@@ -746,10 +746,16 @@ impl SwarmOrchestrator {
                         ..Default::default()
                     }),
                 },
-                None => (None, ResearchBrief {
-                    summary: model_outcome.final_text.clone(),
-                    ..Default::default()
-                }),
+                None => {
+                    let disk_brief = project_root.join(".kuda").join("brief.md");
+                    let disk_content = std::fs::read_to_string(&disk_brief).ok().filter(|s| !s.trim().is_empty());
+                    let text = disk_content.unwrap_or_else(|| model_outcome.final_text.clone());
+                    let brief = parse_brief_doc(&text).unwrap_or_else(|_| ResearchBrief {
+                        summary: text.clone(),
+                        ..Default::default()
+                    });
+                    (Some(text), brief)
+                }
             };
 
             emit(AgentEventKind::PhaseCompleted {
@@ -970,7 +976,13 @@ impl SwarmOrchestrator {
             });
 
             if audit.complete || rlm_round + 1 >= MAX_RLM_ROUNDS {
-                brief_text = Some(format_brief_digest(&brief, &audit));
+                let disk_brief = project_root.join(".kuda").join("brief.md");
+                let disk_content = std::fs::read_to_string(&disk_brief).ok().filter(|s| !s.trim().is_empty());
+                brief_text = raw_brief_text
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .or(disk_content)
+                    .or_else(|| Some(format_brief_digest(&brief, &audit)));
                 if !audit.complete {
                     rlm_ctx.push(Message::user(format!(
                         "[RLM AUDIT] Incomplete but no more rounds allowed. Missing: {}",
