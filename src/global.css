@@ -1334,8 +1334,26 @@ body {
   background: rgba(0, 0, 0, 0.18);
   transition: background 0.15s ease;
 }
-.agent-section-header:hover {
-  background: rgba(255, 255, 255, 0.05);
+.phase-reload-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  margin-left: auto;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.phase-reload-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.2);
+  color: var(--text-primary);
+  transform: rotate(-25deg);
 }
 .agent-section-chevron {
   display: inline-flex;

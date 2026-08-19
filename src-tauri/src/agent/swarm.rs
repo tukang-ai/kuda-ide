@@ -32,7 +32,7 @@ const RLM_VERIFIER_RETRY_TURNS: usize = 2;
 /// data during one run (prevents research ping-pong and shared-context bloat).
 const MAX_THINKER_RESEARCH_REQUESTS: usize = 2;
 /// Turn budget for one RLM supplement round triggered by the Thinker.
-const RLM_SUPPLEMENT_MAX_TURNS: usize = 8;
+const RLM_SUPPLEMENT_MAX_TURNS: usize = 24;
 /// Max changed lines of diff reported back into the shared context per file.
 const MAX_DIFF_LINES_PER_FILE: usize = 120;
 /// Max total chars of one executor report inside the shared context.
@@ -47,7 +47,7 @@ const CHANGED_RATIO_THRESHOLD: f32 = 0.30;
 /// the cached brief against the current tree, capture snippets, WRITE the full
 /// brief to `.kuda/brief.md`, then call `submit_brief` — so it shares the same
 /// generous budget as a fresh research round.
-const SUFFICIENCY_MAX_TURNS: usize = 12;
+const SUFFICIENCY_MAX_TURNS: usize = 24;
 
 // ── Ledger budgets (token economy) ─────────────────────────────────────────
 /// Max chars of the `[RESEARCH BRIEF]` segment of one turn's ledger block.
@@ -716,7 +716,7 @@ impl SwarmOrchestrator {
             total_tokens_out += model_outcome.tokens_out;
             rlm_ctx = model_outcome.history;
 
-            let brief = match &model_outcome.stop_tool_args {
+            let (raw_brief_text, brief) = match &model_outcome.stop_tool_args {
                 Some(args) => match handoff_doc(&project_root, args, &model_outcome.final_text) {
                     Ok(doc) => {
                         // Expand `[SNIPPET id="N"]` placeholders into verbatim
@@ -735,20 +735,21 @@ impl SwarmOrchestrator {
                         }
                         // Keep the on-disk artifact consistent with the expanded brief.
                         persist_handoff_artifact(&project_root, args, &doc);
-                        parse_brief_doc(&doc).unwrap_or_else(|_| ResearchBrief {
-                            summary: doc,
+                        let brief = parse_brief_doc(&doc).unwrap_or_else(|_| ResearchBrief {
+                            summary: doc.clone(),
                             ..Default::default()
-                        })
+                        });
+                        (Some(doc), brief)
                     }
-                    Err(_) => ResearchBrief {
+                    Err(_) => (None, ResearchBrief {
                         summary: model_outcome.final_text.clone(),
                         ..Default::default()
-                    },
+                    }),
                 },
-                None => ResearchBrief {
+                None => (None, ResearchBrief {
                     summary: model_outcome.final_text.clone(),
                     ..Default::default()
-                },
+                }),
             };
 
             emit(AgentEventKind::PhaseCompleted {
@@ -773,7 +774,7 @@ impl SwarmOrchestrator {
                 model: verifier_provider.name().to_string(),
             });
 
-            let brief_doc = format_brief_digest(
+            let rendered_digest = format_brief_digest(
                 &brief,
                 &ContextAudit {
                     complete: false,
@@ -781,6 +782,7 @@ impl SwarmOrchestrator {
                     missing: vec![],
                 },
             );
+            let brief_doc = raw_brief_text.as_deref().unwrap_or(&rendered_digest);
             let mut verify_ctx = rlm_ctx.clone();
             if rlm_round == 0 {
                 verify_ctx.push(Message::user(format!(
@@ -986,6 +988,8 @@ impl SwarmOrchestrator {
             }
 
             // Gap → ask the RLM Model to fill it in one more round.
+            // Continue directly from the verifier's outcome history so prompt cache is 100% preserved.
+            rlm_ctx = verifier_outcome.history;
             let missing_note = audit
                 .missing
                 .iter()
@@ -1090,6 +1094,7 @@ impl SwarmOrchestrator {
         // ── Phase 0.5: Thinker direction checkpoint (kesimpulan sementara) ──
         // Runs on a fresh run AND on a resume that stopped at the direction
         // boundary (`shared` then already contains the validated brief digest).
+        let mut thinker_history: Vec<Message> = Vec::new();
         if resume.is_none() || resume_direction {
         // Before the expensive full plan, the Thinker writes a SHORT temporary
         // conclusion in the agent window. When the plan gate is enabled the run
@@ -1107,18 +1112,18 @@ impl SwarmOrchestrator {
         let mut direction_revisions = 0usize;
         let mut direction_note: Option<String> = None;
         'direction_review: loop {
-        let dir_provider = resolve_role_provider(AgentRole::Thinker, &app_data_dir).await?;
+        let thinker_provider = resolve_role_provider(AgentRole::Thinker, &app_data_dir).await?;
         emit(AgentEventKind::PhaseStarted {
             role: AgentRole::Thinker.key().to_string(),
             label: "Thinker: kesimpulan sementara".to_string(),
-            model: dir_provider.name().to_string(),
+            model: thinker_provider.name().to_string(),
         });
         let direction_prompt = format!(
             "{}\n\nDIRECTION CHECKPOINT (STAGE A — FIRST): you are asked ONLY for your \
              temporary conclusion right now. Do NOT write .kuda/plan.md, do NOT call \
-             submit_plan. You may call batch_file_read (line range only) to verify a specific \
-             snippet the brief references, and request_rlm_research (at most twice per run) \
-             when the plan needs a concrete fact the brief lacks. Write a TEMPORARY \
+             submit_plan. You rely 100% on the validated research brief. If the plan needs \
+             a concrete fact, config value, or file content the brief lacks, call request_rlm_research \
+             (at most twice per run) so the RLM researcher collects it for you. Write a TEMPORARY \
              CONCLUSION as your response text: restate the goal in one line, summarize the \
              chosen approach in 2-4 short bullets, list the main files to be touched, and \
              note key risks/assumptions. The user reads this in the agent window and approves \
@@ -1127,11 +1132,6 @@ impl SwarmOrchestrator {
             PromptComposer::compose_role_prompt(AgentRole::Thinker, &project_root)
         );
 
-        // Direction loop: the Thinker may hand off to the RLM researcher for a
-        // missing fact (`request_rlm_research`). Each round runs a bounded RLM
-        // supplement pass, appends a compact `[RESEARCH SUPPLEMENT]` to the
-        // shared context, and resumes the Thinker. The loop is capped by
-        // MAX_THINKER_RESEARCH_REQUESTS so research cannot ping-pong forever.
         let mut dir_history: Vec<Message> = shared.clone();
         let mut dir_phase_tokens_in: usize = 0;
         let mut dir_phase_tokens_out: usize = 0;
@@ -1143,12 +1143,11 @@ impl SwarmOrchestrator {
                 .run_role_loop(
                     RoleLoopParams {
                         system_prompt: direction_prompt.clone(),
-                        messages: dir_history,
+                        messages: dir_history.clone(),
                         allowed_tools: &[
-                            "batch_file_read".to_string(),
                             "request_rlm_research".to_string(),
                         ],
-                        provider: dir_provider.clone(),
+                        provider: thinker_provider.clone(),
                         max_turns: 3,
                         temperature: 0.2,
                         stop_on_tool: Some("request_rlm_research"),
@@ -1172,8 +1171,6 @@ impl SwarmOrchestrator {
             };
 
             if research_requests >= MAX_THINKER_RESEARCH_REQUESTS {
-                // Budget exhausted: force a real conclusion instead of letting
-                // the Thinker spend the remaining turns on another handoff.
                 let mut conclude_history = outcome.history.clone();
                 conclude_history.push(Message::user(
                     "[RLM] No more research rounds are available for this run. Note anything \
@@ -1187,7 +1184,7 @@ impl SwarmOrchestrator {
                             system_prompt: direction_prompt.clone(),
                             messages: conclude_history,
                             allowed_tools: &["batch_file_read".to_string()],
-                            provider: dir_provider.clone(),
+                            provider: thinker_provider.clone(),
                             max_turns: 2,
                             temperature: 0.2,
                             stop_on_tool: None,
@@ -1208,10 +1205,9 @@ impl SwarmOrchestrator {
                 break concluded;
             }
 
-            // RLM supplement round for the missing facts.
             let (supplement, sup_in, sup_out, sup_cached) = self
                 .run_rlm_research_round(
-                    &shared,
+                    &dir_history,
                     &research_args,
                     tool_ctx,
                     auto_approve,
@@ -1234,14 +1230,26 @@ impl SwarmOrchestrator {
             dir_history.push(supplement_msg);
             research_requests += 1;
         };
+        thinker_history = dir_outcome.history.clone();
         let conclusion = dir_outcome.final_text.trim().to_string();
+        if conclusion.is_empty() {
+            emit(AgentEventKind::PhaseCompleted {
+                role: AgentRole::Thinker.key().to_string(),
+                summary: "Thinker tidak menghasilkan teks kesimpulan sementara (berhenti di pemikiran)".to_string(),
+                tokens_in: dir_phase_tokens_in,
+                tokens_out: dir_phase_tokens_out,
+                cached_in: dir_phase_cached_in,
+            });
+            return Err(AppError::General(
+                "Thinker tidak menghasilkan output kesimpulan sementara (berhenti di pemikiran)".to_string(),
+            ));
+        }
         emit(AgentEventKind::PhaseCompleted {
             role: AgentRole::Thinker.key().to_string(),
-            summary: if conclusion.is_empty() {
-                "Kesimpulan sementara kosong — lanjut ke full plan".to_string()
-            } else {
-                "Kesimpulan sementara ditulis — menunggu review user".to_string()
-            },
+            summary: format!(
+                "Kesimpulan sementara ({} karakter)",
+                conclusion.chars().count()
+            ),
             tokens_in: dir_phase_tokens_in,
             tokens_out: dir_phase_tokens_out,
             cached_in: dir_phase_cached_in,
@@ -1411,10 +1419,12 @@ impl SwarmOrchestrator {
                 direction_ctx, conclusion
             )
         };
-        shared.push(Message::user(format!(
+        let prompt_to_writer = format!(
             "{}Sekarang buat FULL plan ke .kuda/plan.md lalu panggil submit_plan.",
             direction_ctx
-        )));
+        );
+        shared.push(Message::user(prompt_to_writer.clone()));
+        thinker_history.push(Message::user(prompt_to_writer));
         break 'direction_review;
         } // end `'direction_review` review loop (direction approved, or gate off)
 
@@ -1477,15 +1487,21 @@ impl SwarmOrchestrator {
             model: planning_writer_provider.name().to_string(),
         });
 
-        // PRIVATE writer context: seeded with the brief + approved direction,
+        // PRIVATE writer context: seeded with the full Thinker context/cache
+        // (including all research, reasoning, and Thinker messages),
         // accumulates the Thinker's revision notes across rounds, but is NEVER
         // written back into `shared`.
-        let mut writer_ctx: Vec<Message> = shared.clone();
+        let mut writer_ctx: Vec<Message> = if !thinker_history.is_empty() {
+            thinker_history.clone()
+        } else {
+            shared.clone()
+        };
         let writer_spec = AgentRole::PlanningWriter.spec();
         let mut draft_plan: Option<SwarmPlan> = None;
         let mut review_rounds = 0usize;
         let mut last_revision_notes: Option<String> = None;
         let mut last_draft_md: Option<String> = None;
+        let mut raw_draft_doc: Option<String> = None;
         // This whole phase (writer drafts + Thinker reviews) shares one Thinker
         // section in the UI, so aggregate its per-role totals for the badge.
         let mut planner_phase_tokens_in: usize = 0;
@@ -1523,12 +1539,15 @@ impl SwarmOrchestrator {
             planner_phase_tokens_out += writer_outcome.tokens_out;
             writer_ctx = writer_outcome.history;
 
-            let this_plan = match &writer_outcome.stop_tool_args {
+            let (raw_plan_doc, this_plan) = match &writer_outcome.stop_tool_args {
                 Some(args) => match handoff_doc(&project_root, args, &writer_outcome.final_text) {
-                    Ok(doc) => parse_plan_doc(&doc).ok(),
-                    Err(_) => None,
+                    Ok(doc) => {
+                        let plan = parse_plan_doc(&doc).ok();
+                        (Some(doc), plan)
+                    }
+                    Err(_) => (None, None),
                 },
-                None => None,
+                None => (None, None),
             };
             match &this_plan {
                 Some(plan) => emit(AgentEventKind::PhaseCompleted {
@@ -1554,47 +1573,15 @@ impl SwarmOrchestrator {
                         // A later revision round failed: keep the last good draft.
                         break;
                     }
-                    // Round 0 failed with no draft: graceful degradation to a
-                    // synthesized final answer (same path the Thinker used).
-                    let synth = self
-                        .synthesize_answer_from_context(
-                            shared.clone(),
-                            &project_root,
-                            thinker_provider.clone(),
-                            tool_ctx,
-                            auto_approve,
-                            &emit,
-                        )
-                        .await?;
-                    total_tokens += synth.tokens_used;
-                    total_tokens_in += synth.tokens_in;
-                    total_cached_in += synth.cached_in;
-                    total_tokens_out += synth.tokens_out;
-                    emit(AgentEventKind::Finished {
-                        total_tokens_used: total_tokens,
-                        tokens_in: total_tokens_in,
-                        tokens_out: total_tokens_out,
-                        cached_in: total_cached_in,
-                    });
-                    let ledger_answer = truncate_chars(&synth.final_text, LEDGER_ANSWER_CHARS);
-                    return Ok(SwarmOutcome {
-                        final_answer: synth.final_text,
-                        plan: None,
-                        verdict: None,
-                        tokens_used: total_tokens,
-                        ledger: TurnLedger {
-                            brief_digest: ledger.brief_digest.clone(),
-                            plan_markdown: None,
-                            plan_status: None,
-                            execution_review: None,
-                            final_answer: ledger_answer,
-                        },
-                        transcript: transcript.lock().map(|mut c| c.finish()).unwrap_or_default(),
-                    });
+                    return Err(AppError::General(if writer_outcome.exhausted_turns {
+                        "Planning Writer hit the turn limit without submitting a plan".to_string()
+                    } else {
+                        "Planning Writer ended without a plan document".to_string()
+                    }));
                 }
             }
             if let Some(plan) = this_plan {
-                let md = render_plan_markdown(&plan);
+                let md = raw_plan_doc.clone().unwrap_or_else(|| render_plan_markdown(&plan));
                 if last_draft_md.as_deref() == Some(md.as_str()) {
                     // The rewrite left the plan identical — applying the notes
                     // made no difference, so further rounds would not converge.
@@ -1604,6 +1591,7 @@ impl SwarmOrchestrator {
                     break;
                 }
                 last_draft_md = Some(md);
+                raw_draft_doc = raw_plan_doc;
                 draft_plan = Some(plan);
             }
 
@@ -1614,7 +1602,8 @@ impl SwarmOrchestrator {
                 // Unreachable: a draft exists whenever we reach the review.
                 break;
             };
-            let plan_md = render_plan_markdown(current_plan);
+            let rendered_fallback = render_plan_markdown(current_plan);
+            let plan_md = raw_draft_doc.as_deref().unwrap_or(&rendered_fallback);
             emit(AgentEventKind::PhaseStarted {
                 role: AgentRole::Thinker.key().to_string(),
                 label: if review_rounds == 0 {
@@ -1628,12 +1617,18 @@ impl SwarmOrchestrator {
                 "{}\n\nPLAN REVIEW MODE (STAGE B): The Planning Writer drafted the full plan \
                  below by expanding YOUR approved direction. You did NOT write it. READ it \
                  carefully and check it matches your intended design: the goal, the \
-                 architecture, the chosen files, the task split, and the exact anchors/values. \
-                 Do NOT rewrite the plan. Call submit_plan_review exactly once: set \"approved\" \
-                 to true when it matches your idea, OR set \"approved\" to false and put the \
-                 SPECIFIC corrections in \"revision_notes\" (one bullet per issue, naming the \
-                 exact task/section and what is wrong or missing). The Planning Writer applies \
-                 your notes — you will not write the plan body here. Be precise and brief.",
+                 architecture, the chosen files, the task split, and the exact anchors/values.\n\n\
+                 CRITICAL EFFICIENCY & DECISION RULES:\n\
+                 1. Be DECISIVE, FOCUSED, and CONCISE. Do NOT over-analyze hypothetical internal crate \
+                    mechanics or write long internal essays.\n\
+                 2. Verify the core concrete checklist: files, cargo dependencies, endpoints, database \
+                    schema/options, and error handling.\n\
+                 3. If the plan matches your direction and is executable, APPROVE IT IMMEDIATELY without \
+                    hesitation (set \"approved\": true).\n\
+                 4. Only reject (set \"approved\": false) if there is a fatal compilation error or breaking \
+                    logic gap. If rejecting, list all concrete bullet fixes concisely so the Planning \
+                    Writer can apply all surgical fixes in ONE single pass.\n\
+                 5. Call submit_plan_review exactly once in turn 1.",
                 PromptComposer::compose_role_prompt(AgentRole::Thinker, &project_root)
             );
             let mut review_ctx: Vec<Message> = shared.clone();
@@ -1709,8 +1704,8 @@ impl SwarmOrchestrator {
             // Feed the revision notes back into the writer's PRIVATE context.
             writer_ctx.push(Message::user(format!(
                 "[THINKER REVISION REQUEST] The Thinker reviewed your plan and asks for these \
-                 corrections. Apply exactly these and rewrite the FULL plan, then call \
-                 submit_plan again:\n{}",
+                 corrections. Apply these fixes by SURGICALLY EDITING \".kuda/plan.md\" using \
+                 multi_replace_file (do not rewrite the whole file), then call submit_plan again:\n{}",
                 revision_notes.unwrap_or_default()
             )));
             emit(AgentEventKind::PhaseStarted {
@@ -1733,9 +1728,14 @@ impl SwarmOrchestrator {
         // ditingkatkan. Arahannya dikirim ke Thinker, yang memutuskan revisi,
         // lalu Planning Writer menulis ulang. Berulang sampai Reviewer utama
         // menyetujui (cap lama dihapus; guard no-progress mencegah oscilasi).
+        let reviewer_base_ctx = if !thinker_history.is_empty() {
+            &thinker_history
+        } else {
+            &shared
+        };
         let mut final_plan = self
             .run_reviewer_improvement_loop(
-                &shared,
+                reviewer_base_ctx,
                 &draft_plan,
                 &project_root,
                 &app_data_dir,
@@ -2043,9 +2043,18 @@ impl SwarmOrchestrator {
                     model: executor_provider.name().to_string(),
                 });
 
-                // Executor gets the SAME shared context + its task brief.
+                // Executor gets the full Thinker context cache (including Thinker reasoning)
+                // + approved plan & shared task progress.
                 let exec_start = shared.len();
-                let mut exec_history = shared.clone();
+                let mut exec_history = if !thinker_history.is_empty() {
+                    let mut h = thinker_history.clone();
+                    for msg in shared.iter().skip(thinker_history.len().min(shared.len())) {
+                        h.push(msg.clone());
+                    }
+                    h
+                } else {
+                    shared.clone()
+                };
                 exec_history.push(Message::user(build_executor_brief(&approved_plan, task)));
 
                 // Snapshot the WHOLE project tree BEFORE execution so the diff
@@ -2590,7 +2599,12 @@ impl SwarmOrchestrator {
                  cari bug / kesalahan logika / rencana yang keliru atau tidak lengkap di \
                  plan ini — tujuannya MENINGKATKAN KUALITAS plan agar hasil eksekusinya lebih \
                  mendetail dan kompleks (arsitektur, alur data, error handling, edge cases, \
-                 urutan task, ketergantungan antar task, nilai/identifer yang harus presisi). \
+                 urutan task, ketergantungan antar task, nilai/identifer yang harus presisi).\n\n\
+                 CRITICAL AUDIT INSTRUCTION: Conduct an EXHAUSTIVE, ALL-IN-ONE review of the \
+                 ENTIRE plan in a single pass. Do NOT trickle feedback across multiple rounds. \
+                 Inspect the entire architecture, crate dependencies, SQL options, Tokio async \
+                 gotchas, handler error mapping, and JS logic. List ALL issues and concrete \
+                 improvements in 'directions' with exact task/section names and required fixes.\n\n\
                  Anda READ-ONLY: JANGAN menulis file apa pun dan JANGAN menulis ulang plan. \
                  Panggil submit_review_directions tepat satu kali: \"approved\"=true bila plan \
                  sudah solid, atau \"approved\"=false dengan setiap perbaikan sebagai satu item \
@@ -2715,13 +2729,14 @@ impl SwarmOrchestrator {
             let notes = notes.unwrap_or_default();
             let mut writer_ctx: Vec<Message> = shared.to_vec();
             writer_ctx.push(Message::user(format!(
-                "[PLAN SAAT INI — tulis ulang versi perbaikan]\n{}",
+                "[PLAN SAAT INI]\n{}",
                 plan_md
             )));
             writer_ctx.push(Message::user(format!(
                 "[THINKER REVISION REQUEST — berdasarkan arahan Reviewer utama] Terapkan \
-                 koreksi berikut dan tulis ulang SELURUH plan (template yang sama), lalu \
-                 panggil submit_plan dengan {{\"file_path\": \".kuda/plan.md\"}}:\n{}",
+                 koreksi berikut dengan mengedit .kuda/plan.md secara SURGICAL menggunakan \
+                 multi_replace_file (jangan tulis ulang seluruh file), lalu panggil \
+                 submit_plan dengan {{\"file_path\": \".kuda/plan.md\"}}:\n{}",
                 notes
             )));
             emit(AgentEventKind::PhaseStarted {
@@ -3182,15 +3197,11 @@ const MD_FIELD_KEYS: [&str; 5] = ["description:", "context:", "why:", "files:", 
 /// works for `- Description:`, `**Description**:`, and `- **Description**:`.
 fn strip_line_md(line: &str) -> String {
     let mut l = line.trim();
-    if let Some(stripped) = l.strip_prefix("- ") {
+    if let Some(stripped) = l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")) {
         l = stripped.trim();
     }
-    if let Some(inner) = l.strip_prefix("**") {
-        if let Some(end) = inner.find("**") {
-            l = inner[end + 2..].trim();
-        }
-    }
-    l.to_string()
+    // Remove bold/italic markers without stripping the actual key name
+    l.replace("**", "").replace("__", "").trim().to_string()
 }
 
 /// True when the line opens another task field (so a multi-line value stops).
@@ -3231,7 +3242,7 @@ fn parse_plan_markdown(md: &str) -> Result<SwarmPlan> {
         .or_else(|| section_by(&sections, "tujuan"))
         .map(|b| b.trim().to_string())
         .unwrap_or_default();
-    let architecture = section_by(&sections, "architecture")
+    let architecture = section_by(&sections, "arch")
         .or_else(|| section_by(&sections, "arsitektur"))
         .map(|b| b.trim().to_string());
     let risks = section_by(&sections, "risks")
@@ -3391,9 +3402,13 @@ fn parse_audit_markdown(md: &str) -> Result<ContextAudit> {
     }
 
     let mut missing: Vec<AuditGap> = Vec::new();
-    if let Some(body) = section_by(&sections, "missing") {
+    let missing_body = section_by(&sections, "missing")
+        .or_else(|| section_by(&sections, "kekurangan"))
+        .or_else(|| section_by(&sections, "gap"));
+
+    if let Some(body) = missing_body {
         for line in body.lines() {
-            let l = line.trim().trim_start_matches("- ").trim();
+            let l = line.trim().trim_start_matches("- ").trim_start_matches("* ").trim();
             if l.is_empty() {
                 continue;
             }
@@ -3427,6 +3442,19 @@ fn parse_audit_markdown(md: &str) -> Result<ContextAudit> {
             });
         }
     }
+
+    if !complete && missing.is_empty() {
+        missing.push(AuditGap {
+            what: if !summary.is_empty() {
+                summary.clone()
+            } else {
+                "Brief incomplete per verifier audit".to_string()
+            },
+            where_path: String::new(),
+            why_needed: "verification of research completeness".to_string(),
+        });
+    }
+
     Ok(ContextAudit {
         complete,
         summary,

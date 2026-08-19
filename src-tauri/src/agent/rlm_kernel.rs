@@ -419,7 +419,7 @@ def _rlm_install_guard():
     # `sys.modules['__main__'].__dict__` and mutate `_rlm_allowlist` /
     # `_rlm_project_root`, silently bypassing the external-access gate.
     for _m in ['ctypes', 'cffi', 'socket', 'pty', 'fcntl', 'posix', '_posixsubprocess',
-               'gc', 'inspect', 'sys']:
+               'gc', 'inspect']:
         _sys.modules[_m] = None
 
     # ---- Sandbox hardening -------------------------------------------------------

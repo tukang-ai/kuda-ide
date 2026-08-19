@@ -84,7 +84,7 @@ interface AgentState {
   toggleHistoryPanel: () => void;
 
   send: (prompt: string, refreshWorkspace?: () => void) => Promise<void>;
-  resumeRun: () => Promise<void>;
+  resumeRun: (overrideRunId?: string) => Promise<void>;
   cancelRun: () => void;
   revertEditSession: (sessionId?: string, refreshWorkspace?: () => void) => Promise<void>;
   bindExternalEvents: () => void;
@@ -430,8 +430,10 @@ export const useAgent = create<AgentState>((set, get) => ({
     }
   },
 
-  resumeRun: async () => {
-    const target = get().resumeTarget;
+  resumeRun: async (overrideRunId?: string) => {
+    const target = overrideRunId
+      ? { sessionId: get().activeSessionId ?? '', runId: overrideRunId }
+      : get().resumeTarget;
     if (!target || get().busy) return;
     set({
       error: null,

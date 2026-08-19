@@ -14,7 +14,7 @@ const MAX_AGENT_TURNS: usize = 12;
 /// exponential backoff (respecting a provider-supplied "try again in N seconds"
 /// hint when present) before the whole run is abandoned. Permanent errors
 /// (auth, schema, 400s) are NOT retried so failed calls are never multiplied.
-const MAX_LLM_STREAM_RETRIES: usize = 5;
+const MAX_LLM_STREAM_RETRIES: usize = 10;
 /// Soft cap on total characters of tool outputs retained in history, so a
 /// long tool loop cannot blow past the provider's context window. Generous by
 /// design: the RLM Model must be able to SEE full file regions to copy them
@@ -61,9 +61,15 @@ fn is_transient_llm_error(err: &AppError) -> bool {
         || msg.contains("timeout")
         || msg.contains("connection reset")
         || msg.contains("connection refused")
+        || msg.contains("connection closed")
         || msg.contains("service unavailable")
         || msg.contains("bad gateway")
         || msg.contains("no deployments available")
+        || msg.contains("transport error")
+        || msg.contains("error decoding response body")
+        || msg.contains("sse error")
+        || msg.contains("stream error")
+        || msg.contains("broken pipe")
 }
 
 /// Extracts a provider-suggested retry delay ("Try again in 5 seconds" or
@@ -226,7 +232,7 @@ impl AgentOrchestrator {
                     }
                     let base_ms = parse_retry_after_seconds(&e)
                         .map(|s| s * 1000)
-                        .unwrap_or_else(|| 1000u64 << attempt);
+                        .unwrap_or_else(|| 1000u64 << attempt.min(4));
                     let jitter = rand::random::<u64>() % 500;
                     tracing::warn!(
                         "Transient LLM error ({}); retrying in {} ms (attempt {}/{})",
@@ -256,12 +262,11 @@ impl AgentOrchestrator {
     async fn retry_after_empty_transient_stream(
         &self,
         err: &AppError,
-        emitted_any: bool,
+        _emitted_any: bool,
         restarts_left: &mut usize,
         cancel: &crate::agent::tool_registry::CancelFlag,
     ) -> Option<()> {
-        if emitted_any
-            || *restarts_left == 0
+        if *restarts_left == 0
             || !is_transient_llm_error(err)
             || cancel.is_cancelled()
         {
@@ -273,7 +278,7 @@ impl AgentOrchestrator {
             .unwrap_or(2000);
         let jitter = rand::random::<u64>() % 500;
         tracing::warn!(
-            "LLM stream died before any output ({}); restarting in {} ms ({} restart(s) left)",
+            "LLM stream encountered transient network error ({}); restarting turn in {} ms ({} restart(s) left)",
             err,
             base_ms + jitter,
             *restarts_left + 1
@@ -840,6 +845,11 @@ impl AgentOrchestrator {
                 });
             }
 
+            let mut tool_calls = tool_calls;
+            if tool_calls.is_empty() {
+                tool_calls = extract_text_tool_calls(&text_buffer, params.allowed_tools);
+            }
+
             if tool_calls.is_empty() {
                 let reasoning_text = reasoning_buffer.clone();
                 let mut final_message = Message::assistant(&text_buffer);
@@ -1072,7 +1082,95 @@ fn truncate_output(output: &str, max: usize) -> String {
 fn parse_tool_args(
     call: &crate::agent::llm_client::ToolCallChunk,
 ) -> Option<serde_json::Value> {
-    serde_json::from_str(&call.arguments_json).ok()
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&call.arguments_json) {
+        return Some(v);
+    }
+    // Attempt resilient repair for truncated/unclosed JSON strings
+    repair_truncated_json(&call.arguments_json)
+        .or_else(|| parse_xml_tool_args(&call.arguments_json))
+}
+
+fn repair_truncated_json(raw: &str) -> Option<serde_json::Value> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let candidates = [
+        format!("{}\"}}", trimmed),
+        format!("{}}}", trimmed),
+        format!("{}\"}}}}", trimmed),
+        format!("{}}}}}", trimmed),
+    ];
+    for cand in &candidates {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(cand) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn parse_xml_tool_args(raw: &str) -> Option<serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    let trimmed = raw.trim();
+    for tag in &["path", "file_path", "content", "target_path", "pattern", "query"] {
+        let open_tag = format!("<{}>", tag);
+        let close_tag = format!("</{}>", tag);
+        if let Some(start) = trimmed.find(&open_tag) {
+            let rest = &trimmed[start + open_tag.len()..];
+            if let Some(end) = rest.find(&close_tag) {
+                let val = &rest[..end];
+                map.insert((*tag).to_string(), serde_json::Value::String(val.to_string()));
+            }
+        }
+    }
+    if !map.is_empty() {
+        Some(serde_json::Value::Object(map))
+    } else {
+        None
+    }
+}
+
+pub fn extract_text_tool_calls(text: &str, allowed: &[String]) -> Vec<crate::agent::llm_client::ToolCallChunk> {
+    let mut out = Vec::new();
+    for tool_name in allowed {
+        let open_tag = format!("<{}", tool_name);
+        if let Some(pos) = text.find(&open_tag) {
+            let close_tag = format!("</{}>", tool_name);
+            let end_pos = text.find(&close_tag).unwrap_or(text.len());
+            let inside = &text[pos..end_pos];
+            let mut params = serde_json::Map::new();
+            if let Some(path_start) = inside.find("path=\"") {
+                let rest = &inside[path_start + 6..];
+                if let Some(path_end) = rest.find('"') {
+                    params.insert("path".to_string(), serde_json::Value::String(rest[..path_end].to_string()));
+                }
+            } else if let Some(path_start) = inside.find("<path>") {
+                let rest = &inside[path_start + 6..];
+                if let Some(path_end) = rest.find("</path>") {
+                    params.insert("path".to_string(), serde_json::Value::String(rest[..path_end].trim().to_string()));
+                }
+            }
+            if let Some(content_start) = inside.find("<content>") {
+                let rest = &inside[content_start + 9..];
+                if let Some(content_end) = rest.find("</content>") {
+                    params.insert("content".to_string(), serde_json::Value::String(rest[..content_end].to_string()));
+                }
+            } else if let Some(tag_close) = inside.find('>') {
+                let body = inside[tag_close + 1..].trim();
+                if !body.is_empty() {
+                    params.insert("content".to_string(), serde_json::Value::String(body.to_string()));
+                }
+            }
+            if !params.is_empty() {
+                out.push(crate::agent::llm_client::ToolCallChunk {
+                    call_id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+                    tool_name: tool_name.clone(),
+                    arguments_json: serde_json::Value::Object(params).to_string(),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Attempts to split a malformed arguments string (several complete JSON

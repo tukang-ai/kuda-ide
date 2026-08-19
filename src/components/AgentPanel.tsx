@@ -3,7 +3,7 @@ import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import {
-  Bot, Brain, Check, ChevronDown, ClipboardCheck, History, KeyRound, MoreHorizontal, Network, PencilLine, Play, Plus, RotateCcw, SearchCheck, Send, ShieldAlert, Sparkles, Square, TerminalSquare, Trash2, User, Wrench, X,
+  Bot, Brain, Check, ChevronDown, ClipboardCheck, History, KeyRound, MoreHorizontal, Network, PencilLine, Plus, RotateCcw, SearchCheck, Send, ShieldAlert, Sparkles, Square, TerminalSquare, Trash2, User, Wrench, X,
 } from 'lucide-react';
 import 'highlight.js/styles/github-dark.css';
 import { useAgent, UiMessage, UiToolCall, PendingExternalRequest, PendingPlanDecision, PendingDirection } from '../store/agent';
@@ -92,6 +92,8 @@ const formatTokens = (n: number): string => {
 const LiveAssistantMessage = React.memo(
   ({ msg, hubPrices }: { msg: UiMessage; hubPrices: HubPrices }) => {
     const meta = msg.agentRole ? ROLE_META[msg.agentRole] : null;
+    const resumeRun = useAgent((s) => s.resumeRun);
+    const busy = useAgent((s) => s.busy);
     const [collapsed, setCollapsed] = useState<boolean>(msg.minimized ?? false);
     useEffect(() => {
       setCollapsed(msg.minimized ?? false);
@@ -172,6 +174,19 @@ const LiveAssistantMessage = React.memo(
               </span>
             )}
           </span>
+          {!busy && msg.runId && (
+            <button
+              type="button"
+              className="phase-reload-btn"
+              onClick={(e) => {
+                e.stopPropagation();
+                resumeRun(msg.runId);
+              }}
+              title="Jalankan ulang / lanjutkan dari checkpoint fase ini"
+            >
+              <RotateCcw size={11} />
+            </button>
+          )}
           <span className="agent-section-chevron" aria-hidden>
             <ChevronDown size={14} />
           </span>
@@ -224,6 +239,7 @@ const LiveAssistantMessage = React.memo(
     prev.msg.tokensIn === next.msg.tokensIn &&
     prev.msg.tokensOut === next.msg.tokensOut &&
     prev.msg.cachedIn === next.msg.cachedIn &&
+    prev.msg.runId === next.msg.runId &&
     prev.hubPrices === next.hubPrices,
 );
 
@@ -805,10 +821,10 @@ export const AgentPanel: React.FC = () => {
               <button
                 className="primary-btn"
                 style={{ padding: '5px 12px', fontSize: 11, justifyContent: 'center', marginTop: 8, alignSelf: 'flex-start' }}
-                onClick={resumeRun}
+                onClick={() => resumeRun()}
                 title="Lanjutkan dari titik terakhir yang berhasil (riset + arah tetap, tanpa mengulang dari awal)"
               >
-                <Play size={12} /> Lanjutkan dari titik gagal
+                <RotateCcw size={12} /> Jalankan ulang bagian akhir
               </button>
             )}
           </div>

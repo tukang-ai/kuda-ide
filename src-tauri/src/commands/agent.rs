@@ -716,7 +716,7 @@ pub async fn agent_resume_run(
     let tool_registry = state.tool_registry.clone();
 
     // Validate ids at the IPC boundary (defense in depth).
-    if !crate::agent::chat_history::is_safe_id(&session_id)
+    if (!session_id.is_empty() && !crate::agent::chat_history::is_safe_id(&session_id))
         || !crate::agent::chat_history::is_safe_id(&run_id)
     {
         return Err(AppError::General(
@@ -735,7 +735,10 @@ pub async fn agent_resume_run(
         })?;
 
     let history_mgr = ChatHistoryManager::new(&app_data_dir)?;
-    let session = history_mgr.load_session(&session_id)?;
+    let session = match &session_id {
+        id if !id.is_empty() => history_mgr.load_session(id)?,
+        _ => history_mgr.create_session(None)?,
+    };
 
     let orchestrator = SwarmOrchestrator::new(tool_registry);
     let cancel = crate::agent::tool_registry::CancelFlag::new();

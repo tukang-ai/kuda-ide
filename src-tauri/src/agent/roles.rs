@@ -54,9 +54,8 @@ impl AgentRole {
                 max_turns: 6,
                 temperature: 0.2,
                 allowed_tools: vec![
-                    "batch_file_read".into(),
-                    "write_file".into(),
-                    "submit_plan".into(),
+                    "request_rlm_research".into(),
+                    "submit_plan_review".into(),
                 ],
             },
             AgentRole::PlanningWriter => RoleSpec {
@@ -67,11 +66,11 @@ impl AgentRole {
                 // Thinker's. The Thinker only READS the draft and emits a short
                 // approve/revise decision — writing is far more expensive than
                 // reading, so the expensive model is kept off the plan body.
-                max_turns: 8,
+                max_turns: 24,
                 temperature: 0.1,
                 allowed_tools: vec![
-                    "batch_file_read".into(),
                     "write_file".into(),
+                    "multi_replace_file".into(),
                     "submit_plan".into(),
                 ],
             },
@@ -139,7 +138,7 @@ impl AgentRole {
             },
             AgentRole::RlmModel => RoleSpec {
                 role: *self,
-                max_turns: 12,
+                max_turns: 24,
                 temperature: 0.2,
                 allowed_tools: vec![
                     "list_dir".into(),
@@ -453,14 +452,12 @@ mod tests {
     #[test]
     fn test_thinker_is_slim_after_brief() {
         let spec = AgentRole::Thinker.spec();
-        assert!(spec.allowed_tools.contains(&"submit_plan".to_string()));
-        assert!(spec.allowed_tools.contains(&"batch_file_read".to_string()));
-        // Thinker writes the plan artifact itself, but stays read-only on the codebase.
-        assert!(spec.allowed_tools.contains(&"write_file".to_string()));
-        for forbidden in ["list_dir", "grep_search", "rlm_python", "run_command", "multi_replace_file"] {
+        assert!(spec.allowed_tools.contains(&"request_rlm_research".to_string()));
+        assert!(spec.allowed_tools.contains(&"submit_plan_review".to_string()));
+        for forbidden in ["list_dir", "grep_search", "rlm_python", "run_command", "multi_replace_file", "batch_file_read", "write_file"] {
             assert!(
                 !spec.allowed_tools.contains(&forbidden.to_string()),
-                "slim Thinker must not have exploration tool {}",
+                "slim Thinker must not have I/O exploration or mutation tool {}",
                 forbidden
             );
         }
@@ -481,10 +478,10 @@ mod tests {
         // The writer owns the plan body: it writes .kuda/plan.md and submits it.
         assert!(spec.allowed_tools.contains(&"submit_plan".to_string()));
         assert!(spec.allowed_tools.contains(&"write_file".to_string()));
-        assert!(spec.allowed_tools.contains(&"batch_file_read".to_string()));
-        // It must NOT mutate code files — only the plan artifact.
+        assert!(spec.allowed_tools.contains(&"multi_replace_file".to_string()));
+        // It must NOT read files, mutate code files or execute commands.
         for forbidden in [
-            "multi_replace_file",
+            "batch_file_read",
             "list_dir",
             "grep_search",
             "code_outline",

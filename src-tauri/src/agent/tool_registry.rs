@@ -549,16 +549,16 @@ impl Tool for BatchFileReadTool {
             match FileSystemIO::read_file(&path_buf, &ctx.project_root, start_line, end_line) {
                 Ok(content) => {
                     let lines: Vec<&str> = content.content.lines().collect();
-                    let total_lines = lines.len();
-                    output.push_str(&format!("=== FILE: {} [total_lines: {}] ===\n", p, total_lines));
+                    let start_idx = start_line.unwrap_or(1);
+                    output.push_str(&format!("=== FILE: {} [lines {}-{} ({} lines shown)] ===\n", p, start_idx, start_idx + lines.len().saturating_sub(1), lines.len()));
 
                     if let Some(pat) = pattern_opt {
                         let pat_lower = pat.to_lowercase();
                         let mut match_count = 0;
                         for (idx, line) in lines.iter().enumerate() {
-                            let line_num = start_line.unwrap_or(1) + idx;
+                            let line_num = start_idx + idx;
                             if line.to_lowercase().contains(&pat_lower) {
-                                output.push_str(&format!("{}: {}\n", line_num, line));
+                                output.push_str(&format!("{:4} | {}\n", line_num, line));
                                 match_count += 1;
                             }
                         }
@@ -567,8 +567,11 @@ impl Tool for BatchFileReadTool {
                         }
                         output.push('\n');
                     } else {
-                        output.push_str(&content.content);
-                        output.push_str("\n\n");
+                        for (idx, line) in lines.iter().enumerate() {
+                            let line_num = start_idx + idx;
+                            output.push_str(&format!("{:4} | {}\n", line_num, line));
+                        }
+                        output.push('\n');
                     }
                 }
                 Err(e) => {
@@ -725,17 +728,22 @@ impl Tool for MultiReplaceFileTool {
             let range_start = line_starts[first];
             let range_end = line_starts.get(last + 1).copied().unwrap_or(content.len());
             let range = &content[range_start..range_end];
-            let Some(rel) = range.find(chunk.target_content.as_str()) else {
+            let abs = if let Some(rel) = range.find(chunk.target_content.as_str()) {
+                range_start + rel
+            } else if let Some(pos) = content.find(chunk.target_content.as_str()) {
+                // Line shifted from earlier edits or minor index drift: match in full content
+                pos
+            } else {
+                let actual_preview: String = content.lines().skip(first).take(last - first + 1).collect::<Vec<_>>().join("\n");
                 return Ok(ToolResult {
                     success: false,
                     output: format!(
-                        "Target content chunk at line {}-{} not found within that line range.",
-                        chunk.start_line, chunk.end_line
+                        "Target content chunk not found in file.\nExpected target:\n{:?}\nActual content currently at line {}-{}:\n{}\nPlease check exact characters and match the actual text.",
+                        chunk.target_content, chunk.start_line, chunk.end_line, actual_preview
                     ),
                     is_error: true,
                 });
             };
-            let abs = range_start + rel;
             content = format!(
                 "{}{}{}",
                 &content[..abs],
@@ -1079,11 +1087,11 @@ impl Tool for WriteFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_file".to_string(),
-            description: "Creates a new file or fully overwrites an existing file with the given content. Creates parent directories when needed and an automatic Full File Checkpoint when the file already exists.".to_string(),
+            description: "Creates a new file or fully overwrites an existing file with the given content. Pass 'path' as the FIRST argument. Creates parent directories when needed and an automatic Full File Checkpoint when the file already exists.".to_string(),
             parameters_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Target file path (relative to project root)" },
+                    "path": { "type": "string", "description": "Target file path (relative to project root). MUST be passed FIRST before content." },
                     "content": { "type": "string", "description": "Full file content to write" }
                 },
                 "required": ["path", "content"]
@@ -1093,12 +1101,17 @@ impl Tool for WriteFileTool {
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> Result<ToolResult> {
-        let path_str = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
         let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let path_str = params
+            .get("path")
+            .or_else(|| params.get("file_path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
         if path_str.trim().is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: "Path cannot be empty".to_string(),
+                output: "Path cannot be empty. In write_file, pass the 'path' parameter as the FIRST key in your tool arguments.".to_string(),
                 is_error: true,
             });
         }

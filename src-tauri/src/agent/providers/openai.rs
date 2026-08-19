@@ -52,13 +52,16 @@ impl LlmProvider for OpenAiProvider {
         // stalled stream aborts) while long, actively-streaming responses
         // stay unaffected.
         let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .read_timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .read_timeout(std::time::Duration::from_secs(300))
+            .tcp_keepalive(Some(std::time::Duration::from_secs(15)))
             .build()
             .map_err(|e| AppError::General(format!("Failed to build HTTP client: {}", e)))?;
         let mut req_builder = client
             .post(&url)
-            .header("Content-Type", "application/json");
+            .header("Content-Type", "application/json")
+            .header("Connection", "keep-alive")
+            .header("Accept", "text/event-stream");
 
         if !self.api_key.is_empty() {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", self.api_key));
@@ -127,11 +130,27 @@ impl LlmProvider for OpenAiProvider {
                                         usage.get("prompt_cache_hit_tokens").and_then(|t| t.as_u64())
                                     })
                                     .unwrap_or(0);
+                                let completion = usage
+                                    .get("completion_tokens")
+                                    .and_then(|t| t.as_u64())
+                                    .unwrap_or(0);
+                                let reasoning = usage
+                                    .get("completion_tokens_details")
+                                    .and_then(|d| d.get("reasoning_tokens"))
+                                    .and_then(|t| t.as_u64())
+                                    .unwrap_or(0);
+                                let output_tokens = if completion == 0 {
+                                    reasoning
+                                } else if completion < reasoning {
+                                    completion + reasoning
+                                } else {
+                                    completion
+                                };
                                 out.push(Ok(StreamChunk {
                                     kind: ChunkKind::Usage(StreamUsage {
                                         input_tokens: usage.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
                                         cached_input_tokens: cached,
-                                        output_tokens: usage.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+                                        output_tokens,
                                     }),
                                 }));
                             }
@@ -382,10 +401,13 @@ fn build_openai_body(request: &CompletionRequest, model_name: &str) -> serde_jso
         "stream_options": { "include_usage": true }
     });
 
-    // 2b. Max output tokens: omitted entirely when unset so the provider uses
-    // the model's own maximum output (no artificial cap on plans/answers).
-    if let Some(mt) = request.max_tokens {
-        body["max_tokens"] = serde_json::json!(mt);
+    // 2b. Max output tokens: default to 120k tokens so long plans/responses
+    // are not prematurely truncated at the server default 4096 cap.
+    let max_tok = request.max_tokens.unwrap_or(120_000);
+    if model_name.starts_with("o1") || model_name.starts_with("o3") {
+        body["max_completion_tokens"] = serde_json::json!(max_tok);
+    } else {
+        body["max_tokens"] = serde_json::json!(max_tok);
     }
 
     // 3. Tool Declarations (OpenAI Function Calling Spec)
