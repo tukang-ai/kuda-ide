@@ -1113,17 +1113,27 @@ fn repair_truncated_json(raw: &str) -> Option<serde_json::Value> {
 fn parse_xml_tool_args(raw: &str) -> Option<serde_json::Value> {
     let mut map = serde_json::Map::new();
     let trimmed = raw.trim();
-    for tag in &["path", "file_path", "content", "target_path", "pattern", "query"] {
-        let open_tag = format!("<{}>", tag);
-        let close_tag = format!("</{}>", tag);
-        if let Some(start) = trimmed.find(&open_tag) {
-            let rest = &trimmed[start + open_tag.len()..];
-            if let Some(end) = rest.find(&close_tag) {
-                let val = &rest[..end];
-                map.insert((*tag).to_string(), serde_json::Value::String(val.to_string()));
+    
+    // Generic regex to capture any <tag>value</tag> or <tag attr="val">value</tag>
+    if let Ok(re) = regex::Regex::new(r#"<([a-zA-Z0-9_-]+)(?:\s+[^>]*)?>([\s\S]*?)</\1>"#) {
+        for cap in re.captures_iter(trimmed) {
+            if let (Some(k), Some(v)) = (cap.get(1), cap.get(2)) {
+                let key = k.as_str();
+                let mut val = v.as_str().to_string();
+                if val.starts_with("<![CDATA[") && val.ends_with("]]>") {
+                    val = val[9..val.len() - 3].to_string();
+                }
+                if let Ok(json_v) = serde_json::from_str::<serde_json::Value>(&val) {
+                    if json_v.is_array() || json_v.is_object() || json_v.is_boolean() || json_v.is_number() {
+                        map.insert(key.to_string(), json_v);
+                        continue;
+                    }
+                }
+                map.insert(key.to_string(), serde_json::Value::String(val));
             }
         }
     }
+    
     if !map.is_empty() {
         Some(serde_json::Value::Object(map))
     } else {
@@ -1135,33 +1145,84 @@ pub fn extract_text_tool_calls(text: &str, allowed: &[String]) -> Vec<crate::age
     let mut out = Vec::new();
     for tool_name in allowed {
         let open_tag = format!("<{}", tool_name);
-        if let Some(pos) = text.find(&open_tag) {
+        let mut search_from = 0;
+
+        while let Some(rel_pos) = text[search_from..].find(&open_tag) {
+            let pos = search_from + rel_pos;
+            let after_open = &text[pos + open_tag.len()..];
+
+            // Check if it's an exact tag match (e.g. `<write_file>` or `<write_file `)
+            if !after_open.starts_with('>') && !after_open.starts_with(' ') && !after_open.starts_with('\n') && !after_open.starts_with('\t') {
+                search_from = pos + open_tag.len();
+                continue;
+            }
+
             let close_tag = format!("</{}>", tool_name);
-            let end_pos = text.find(&close_tag).unwrap_or(text.len());
-            let inside = &text[pos..end_pos];
+            let (inside, next_search) = if let Some(end_rel) = after_open.find(&close_tag) {
+                let inside_str = &after_open[..end_rel];
+                (inside_str, pos + open_tag.len() + end_rel + close_tag.len())
+            } else {
+                (after_open, text.len())
+            };
+
+            search_from = next_search;
+
             let mut params = serde_json::Map::new();
-            if let Some(path_start) = inside.find("path=\"") {
-                let rest = &inside[path_start + 6..];
-                if let Some(path_end) = rest.find('"') {
-                    params.insert("path".to_string(), serde_json::Value::String(rest[..path_end].to_string()));
+
+            if let Some(tag_header_end) = inside.find('>') {
+                let header = &inside[..tag_header_end];
+                let body = &inside[tag_header_end + 1..];
+
+                // 1. Extract attributes from opening tag if any (e.g. `<write_file path="foo">`)
+                if let Ok(re) = regex::Regex::new(r#"([a-zA-Z0-9_-]+)=["']([^"']*)["']"#) {
+                    for cap in re.captures_iter(header) {
+                        if let (Some(k), Some(v)) = (cap.get(1), cap.get(2)) {
+                            params.insert(k.as_str().to_string(), serde_json::Value::String(v.as_str().to_string()));
+                        }
+                    }
                 }
-            } else if let Some(path_start) = inside.find("<path>") {
-                let rest = &inside[path_start + 6..];
-                if let Some(path_end) = rest.find("</path>") {
-                    params.insert("path".to_string(), serde_json::Value::String(rest[..path_end].trim().to_string()));
+
+                // 2. Extract child tags (e.g. `<path>...</path>`, `<content>...</content>`)
+                let mut found_children = false;
+                if let Ok(child_re) = regex::Regex::new(r#"<([a-zA-Z0-9_-]+)>([\s\S]*?)</\1>"#) {
+                    for cap in child_re.captures_iter(body) {
+                        if let (Some(k), Some(v)) = (cap.get(1), cap.get(2)) {
+                            found_children = true;
+                            let key = k.as_str();
+                            let mut val = v.as_str().to_string();
+                            if val.starts_with("<![CDATA[") && val.ends_with("]]>") {
+                                val = val[9..val.len() - 3].to_string();
+                            }
+                            if let Ok(json_v) = serde_json::from_str::<serde_json::Value>(&val) {
+                                if json_v.is_array() || json_v.is_object() || json_v.is_boolean() || json_v.is_number() {
+                                    params.insert(key.to_string(), json_v);
+                                    continue;
+                                }
+                            }
+                            params.insert(key.to_string(), serde_json::Value::String(val));
+                        }
+                    }
+                }
+
+                // 3. Fallback: If no child tags were found, assign body to default param
+                if !found_children && !body.trim().is_empty() {
+                    let default_key = match tool_name.as_str() {
+                        "write_file" => "content",
+                        "run_command" => "command",
+                        "rlm_python" => "code",
+                        "grep_search" => "query",
+                        "batch_file_read" => "paths",
+                        "code_outline" => "path",
+                        "list_dir" => "path",
+                        "submit_plan" => "file_path",
+                        _ => "content",
+                    };
+                    if !params.contains_key(default_key) {
+                        params.insert(default_key.to_string(), serde_json::Value::String(body.trim().to_string()));
+                    }
                 }
             }
-            if let Some(content_start) = inside.find("<content>") {
-                let rest = &inside[content_start + 9..];
-                if let Some(content_end) = rest.find("</content>") {
-                    params.insert("content".to_string(), serde_json::Value::String(rest[..content_end].to_string()));
-                }
-            } else if let Some(tag_close) = inside.find('>') {
-                let body = inside[tag_close + 1..].trim();
-                if !body.is_empty() {
-                    params.insert("content".to_string(), serde_json::Value::String(body.to_string()));
-                }
-            }
+
             if !params.is_empty() {
                 out.push(crate::agent::llm_client::ToolCallChunk {
                     call_id: format!("call_{}", uuid::Uuid::new_v4().simple()),
