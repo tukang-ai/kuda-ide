@@ -2479,37 +2479,33 @@ impl SwarmOrchestrator {
             )
             .await?;
 
+        let supp_path = project_root.join(".kuda").join("supplement.md");
+        let raw_disk_supp = std::fs::read_to_string(&supp_path).ok().filter(|s| !s.trim().is_empty());
         let supplement = match &outcome.stop_tool_args {
             Some(args) => match handoff_doc(&project_root, args, &outcome.final_text) {
                 Ok(doc) => {
                     let doc = resolve_snippet_placeholders(&project_root, &doc).await;
-                    let brief = parse_brief_doc(&doc).unwrap_or_else(|_| ResearchBrief {
-                        summary: doc,
-                        ..Default::default()
-                    });
-                    format_brief_digest(
-                        &brief,
-                        &ContextAudit {
-                            complete: false,
-                            summary:
-                                "Supplement dikumpulkan RLM atas permintaan Thinker — tidak \
-                                 diverifikasi oleh RLM Verifier."
-                                    .to_string(),
-                            missing: vec![],
-                        },
-                    )
+                    if let Ok(brief) = parse_brief_doc(&doc) {
+                        if !brief.relevant_snippets.is_empty() || !brief.key_files.is_empty() {
+                            format_brief_digest(
+                                &brief,
+                                &ContextAudit {
+                                    complete: false,
+                                    summary: "Supplement dikumpulkan RLM atas permintaan Thinker".to_string(),
+                                    missing: vec![],
+                                },
+                            )
+                        } else {
+                            raw_disk_supp.unwrap_or(doc)
+                        }
+                    } else {
+                        raw_disk_supp.unwrap_or(doc)
+                    }
                 }
-                Err(_) => outcome.final_text.clone(),
+                Err(_) => raw_disk_supp.unwrap_or_else(|| outcome.final_text.clone()),
             },
             None => {
-                if outcome.exhausted_turns {
-                    format!(
-                        "RLM kehabisan turn tanpa submit_brief. Hasil parsial (tidak diverifikasi):\n{}",
-                        outcome.final_text
-                    )
-                } else {
-                    outcome.final_text.clone()
-                }
+                raw_disk_supp.unwrap_or_else(|| outcome.final_text.clone())
             }
         };
 

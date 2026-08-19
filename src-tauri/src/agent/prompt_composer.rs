@@ -113,7 +113,7 @@ Examples:
 - Editing a file:
   <multi_replace_file>
   <path>src/main.rs</path>
-  <chunks>[{"start_line": 1, "end_line": 5, "target_content": "old", "replacement_content": "new"}]</chunks>
+  <chunks>[{{"start_line": 1, "end_line": 5, "target_content": "old", "replacement_content": "new"}}]</chunks>
   </multi_replace_file>
 - Reading files:
   <batch_file_read>
