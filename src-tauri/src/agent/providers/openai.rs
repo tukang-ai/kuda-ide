@@ -3,6 +3,8 @@ use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use crate::error::{AppError, Result};
 use crate::agent::llm_client::{
     ChunkKind, CompletionRequest, LlmProvider, MessageRole, StreamChunk, StreamUsage, ToolCallChunk,
@@ -97,8 +99,10 @@ impl LlmProvider for OpenAiProvider {
         // when the stream ends WITHOUT a `[DONE]` event (some providers close
         // abruptly; without this the tool calls silently vanish and the model's
         // turn is treated as text-only).
-        let tool_buffer = std::sync::Arc::new(std::sync::Mutex::new(ToolCallBuffer::new()));
+        let tool_buffer = Arc::new(std::sync::Mutex::new(ToolCallBuffer::new()));
         let flat_buffer = tool_buffer.clone();
+        let saw_done = Arc::new(AtomicBool::new(false));
+        let saw_done_inner = saw_done.clone();
 
         let stream = response
             .bytes_stream()
@@ -107,6 +111,7 @@ impl LlmProvider for OpenAiProvider {
                 let mut out: Vec<Result<StreamChunk>> = Vec::new();
                 match event {
                     Ok(ev) if ev.data == "[DONE]" => {
+                        saw_done_inner.store(true, Ordering::SeqCst);
                         // Flush accumulated tool call buffers if any. The single
                         // `Done` marker is emitted by the `chain` below (once, at
                         // stream end) so consumers never see a duplicate.
@@ -154,57 +159,52 @@ impl LlmProvider for OpenAiProvider {
                                     }),
                                 }));
                             }
-                            if let Some(delta) = json.pointer("/choices/0/delta") {
-                                // 0. Reasoning content delta (DeepSeek thinking mode).
-                                // Must be captured so it can be passed back to the API.
-                                if let Some(reasoning) = delta
-                                    .get("reasoning_content")
-                                    .and_then(|c| c.as_str())
-                                {
-                                    if !reasoning.is_empty() {
-                                        out.push(Ok(StreamChunk {
-                                            kind: ChunkKind::ReasoningDelta(reasoning.to_string()),
-                                        }));
-                                    }
-                                }
+                            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                                for choice in choices {
+                                    if let Some(delta) = choice.get("delta") {
+                                        // 1. Text delta
+                                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                            if !content.is_empty() {
+                                                out.push(Ok(StreamChunk {
+                                                    kind: ChunkKind::TextDelta(content.to_string()),
+                                                }));
+                                            }
+                                        }
 
-                                // 1. Text Content Delta
-                                if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                                    if !content.is_empty() {
-                                        out.push(Ok(StreamChunk {
-                                            kind: ChunkKind::TextDelta(content.to_string()),
-                                        }));
-                                    }
-                                }
+                                        // 2. Reasoning delta (DeepSeek / QwQ / Kimi)
+                                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
+                                            if !reasoning.is_empty() {
+                                                out.push(Ok(StreamChunk {
+                                                    kind: ChunkKind::ReasoningDelta(reasoning.to_string()),
+                                                }));
+                                            }
+                                        }
 
-                                // 2. Tool Calls Delta
-                                if let Some(tool_calls) = delta.get("tool_calls").and_then(|tc| tc.as_array()) {
-                                    for tc in tool_calls {
-                                        let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                                        let id = tc.get("id").and_then(|s| s.as_str());
-                                        let name = tc.get("function")
-                                            .and_then(|f| f.get("name"))
-                                            .and_then(|n| n.as_str());
-                                        let args_chunk = tc.get("function")
-                                            .and_then(|f| f.get("arguments"))
-                                            .and_then(|a| a.as_str());
-                                        flat_buffer.lock().unwrap().push(index, id, name, args_chunk);
+                                        // 3. Tool calls buffering
+                                        if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                                            let mut buf = flat_buffer.lock().unwrap();
+                                            for tc in tool_calls {
+                                                let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                                                let id = tc.get("id").and_then(|i| i.as_str());
+                                                let name = tc.pointer("/function/name").and_then(|n| n.as_str());
+                                                let args = tc.pointer("/function/arguments").and_then(|a| a.as_str());
+                                                buf.push(idx, id, name, args);
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        out.push(Err(AppError::General(format!("OpenAI SSE error: {}", e))));
+                        out.push(Err(AppError::General(format!("[origin-close] SSE stream error: {}", e))));
                     }
                 }
                 futures::stream::iter(out)
             })
-            // After the stream ends, flush any tool calls still buffered (some
-            // providers close without a `[DONE]` event; without this the tool
-            // calls silently vanish and the turn is treated as text-only).
-            // `once().flatten()` keeps the flush LAZY so it runs only after the
-            // upstream stream has actually ended.
+            // After the stream ends, flush any tool calls still buffered.
+            // If the stream ended without `[DONE]`, emit an explicit [origin-close] error
+            // so orchestrator triggers an auto-retry instead of accepting broken half-output.
             .chain(
                 futures::stream::once(async move {
                     let mut chunks: Vec<Result<StreamChunk>> = Vec::new();
@@ -216,7 +216,13 @@ impl LlmProvider for OpenAiProvider {
                             }));
                         }
                     }
-                    chunks.push(Ok(StreamChunk { kind: ChunkKind::Done }));
+                    if saw_done.load(Ordering::SeqCst) {
+                        chunks.push(Ok(StreamChunk { kind: ChunkKind::Done }));
+                    } else {
+                        chunks.push(Err(AppError::General(
+                            "[origin-close] Stream disconnected abruptly before [DONE] tag was received".to_string(),
+                        )));
+                    }
                     futures::stream::iter(chunks)
                 })
                 .flatten(),
