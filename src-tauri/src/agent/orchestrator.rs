@@ -848,6 +848,17 @@ impl AgentOrchestrator {
 
             let mut tool_calls = tool_calls;
             if tool_calls.is_empty() {
+                // If model opened a tool tag but stream got cut off before closing it, trigger auto-retry!
+                for tool_name in params.allowed_tools {
+                    let open_tag = format!("<{}", tool_name);
+                    let close_tag = format!("</{}>", tool_name);
+                    if text_buffer.contains(&open_tag) && !text_buffer.contains(&close_tag) {
+                        return Err(AppError::General(format!(
+                            "[origin-close] Output terpotong di tengah stream: tag XML <{}> belum tertutup </{}>. Melakukan retry otomatis...",
+                            tool_name, tool_name
+                        )));
+                    }
+                }
                 tool_calls = extract_text_tool_calls(&text_buffer, params.allowed_tools);
             }
 
@@ -1158,14 +1169,15 @@ pub fn extract_text_tool_calls(text: &str, allowed: &[String]) -> Vec<crate::age
             }
 
             let close_tag = format!("</{}>", tool_name);
-            let (inside, next_search) = if let Some(end_rel) = after_open.find(&close_tag) {
-                let inside_str = &after_open[..end_rel];
-                (inside_str, pos + open_tag.len() + end_rel + close_tag.len())
-            } else {
-                (after_open, text.len())
+            let Some(end_rel) = after_open.find(&close_tag) else {
+                // If closing tag is missing, the tool call is incomplete/truncated.
+                // Do NOT parse or execute it.
+                search_from = pos + open_tag.len();
+                continue;
             };
 
-            search_from = next_search;
+            let inside = &after_open[..end_rel];
+            search_from = pos + open_tag.len() + end_rel + close_tag.len();
 
             let mut params = serde_json::Map::new();
 
@@ -1183,11 +1195,9 @@ pub fn extract_text_tool_calls(text: &str, allowed: &[String]) -> Vec<crate::age
                 }
 
                 // 2. Extract child tags (e.g. `<path>...</path>`, `<content>...</content>`)
-                let mut found_children = false;
                 if let Ok(child_re) = regex::Regex::new(r#"<([a-zA-Z0-9_-]+)>([\s\S]*?)</\1>"#) {
                     for cap in child_re.captures_iter(body) {
                         if let (Some(k), Some(v)) = (cap.get(1), cap.get(2)) {
-                            found_children = true;
                             let key = k.as_str();
                             let mut val = v.as_str().to_string();
                             if val.starts_with("<![CDATA[") && val.ends_with("]]>") {
@@ -1201,24 +1211,6 @@ pub fn extract_text_tool_calls(text: &str, allowed: &[String]) -> Vec<crate::age
                             }
                             params.insert(key.to_string(), serde_json::Value::String(val));
                         }
-                    }
-                }
-
-                // 3. Fallback: If no child tags were found, assign body to default param
-                if !found_children && !body.trim().is_empty() {
-                    let default_key = match tool_name.as_str() {
-                        "write_file" => "content",
-                        "run_command" => "command",
-                        "rlm_python" => "code",
-                        "grep_search" => "query",
-                        "batch_file_read" => "paths",
-                        "code_outline" => "path",
-                        "list_dir" => "path",
-                        "submit_plan" => "file_path",
-                        _ => "content",
-                    };
-                    if !params.contains_key(default_key) {
-                        params.insert(default_key.to_string(), serde_json::Value::String(body.trim().to_string()));
                     }
                 }
             }

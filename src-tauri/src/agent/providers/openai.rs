@@ -161,6 +161,12 @@ impl LlmProvider for OpenAiProvider {
                             }
                             if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
                                 for choice in choices {
+                                    if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+                                        if finish == "length" {
+                                            out.push(Err(AppError::General("[origin-close] Response terpotong karena batas max_tokens tercapai (finish_reason: length)".to_string())));
+                                        }
+                                    }
+
                                     if let Some(delta) = choice.get("delta") {
                                         // 1. Text delta
                                         if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
