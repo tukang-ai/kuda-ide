@@ -1102,11 +1102,21 @@ impl Tool for WriteFileTool {
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> Result<ToolResult> {
         let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let path_str = params
+        let mut path_str = params
             .get("path")
             .or_else(|| params.get("file_path"))
+            .or_else(|| params.get("target_path"))
+            .or_else(|| params.get("filename"))
+            .or_else(|| params.get("file"))
+            .or_else(|| params.get("name"))
+            .or_else(|| params.get("dest"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
+
+        // Fallback: If path is omitted/empty but content is clearly a plan document, assume .kuda/plan.md
+        if path_str.trim().is_empty() && (content.contains("# Goal") || content.contains("## Architecture") || content.contains("## Task 1")) {
+            path_str = ".kuda/plan.md";
+        }
 
         if path_str.trim().is_empty() {
             return Ok(ToolResult {
