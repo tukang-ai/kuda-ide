@@ -780,15 +780,9 @@ impl SwarmOrchestrator {
                 model: verifier_provider.name().to_string(),
             });
 
-            let rendered_digest = format_brief_digest(
-                &brief,
-                &ContextAudit {
-                    complete: false,
-                    summary: String::new(),
-                    missing: vec![],
-                },
-            );
-            let brief_doc = raw_brief_text.as_deref().unwrap_or(&rendered_digest);
+            let disk_brief = project_root.join(".kuda").join("brief.md");
+            let disk_content = std::fs::read_to_string(&disk_brief).ok().filter(|s| !s.trim().is_empty());
+            let brief_doc = raw_brief_text.as_deref().or(disk_content.as_deref()).unwrap_or(&model_outcome.final_text);
             let mut verify_ctx = rlm_ctx.clone();
             if rlm_round == 0 {
                 verify_ctx.push(Message::user(format!(
@@ -982,7 +976,7 @@ impl SwarmOrchestrator {
                     .clone()
                     .filter(|s| !s.trim().is_empty())
                     .or(disk_content)
-                    .or_else(|| Some(format_brief_digest(&brief, &audit)));
+                    .or_else(|| Some(model_outcome.final_text.clone()));
                 if !audit.complete {
                     rlm_ctx.push(Message::user(format!(
                         "[RLM AUDIT] Incomplete but no more rounds allowed. Missing: {}",
@@ -2497,22 +2491,7 @@ impl SwarmOrchestrator {
             Some(args) => match handoff_doc(&project_root, args, &outcome.final_text) {
                 Ok(doc) => {
                     let doc = resolve_snippet_placeholders(&project_root, &doc).await;
-                    if let Ok(brief) = parse_brief_doc(&doc) {
-                        if !brief.relevant_snippets.is_empty() || !brief.key_files.is_empty() {
-                            format_brief_digest(
-                                &brief,
-                                &ContextAudit {
-                                    complete: false,
-                                    summary: "Supplement dikumpulkan RLM atas permintaan Thinker".to_string(),
-                                    missing: vec![],
-                                },
-                            )
-                        } else {
-                            raw_disk_supp.unwrap_or(doc)
-                        }
-                    } else {
-                        raw_disk_supp.unwrap_or(doc)
-                    }
+                    raw_disk_supp.unwrap_or(doc)
                 }
                 Err(_) => raw_disk_supp.unwrap_or_else(|| outcome.final_text.clone()),
             },
@@ -3726,82 +3705,6 @@ fn render_plan_markdown(plan: &SwarmPlan) -> String {
     s
 }
 
-/// Renders the validated brief + audit into a compact text digest that the
-/// slim Thinker consumes as ground truth (no raw exploration, no tool dumps).
-fn format_brief_digest(brief: &ResearchBrief, audit: &ContextAudit) -> String {
-    let mut s = String::new();
-    s.push_str("## SUMMARY\n");
-    s.push_str(&brief.summary.trim());
-    s.push('\n');
-
-    if !brief.key_files.is_empty() {
-        s.push_str("\n## KEY FILES\n");
-        for f in &brief.key_files {
-            let syms = if f.key_symbols.is_empty() {
-                String::from("(none noted)")
-            } else {
-                f.key_symbols.join(", ")
-            };
-            s.push_str(&format!("- {} — {}\n  symbols: {}\n", f.path, f.why, syms));
-        }
-    }
-
-    if !brief.relevant_snippets.is_empty() {
-        s.push_str("\n## RELEVANT SNIPPETS\n");
-        for snip in &brief.relevant_snippets {
-            let lines = if snip.lines.is_empty() {
-                String::from("(whole)")
-            } else {
-                snip.lines.clone()
-            };
-            let body = snip.content.trim();
-            s.push_str(&format!("--- {} [{}]\n{}\n", snip.path, lines, body));
-        }
-    }
-
-    if !brief.conventions.is_empty() {
-        s.push_str("\n## CONVENTIONS\n");
-        s.push_str(brief.conventions.trim());
-        s.push('\n');
-    }
-
-    if !brief.risks_unknowns.is_empty() {
-        s.push_str("\n## RISKS / UNKNOWNS\n");
-        for r in &brief.risks_unknowns {
-            s.push_str(&format!("- {}\n", r));
-        }
-    }
-
-    if !brief.external_pulls.is_empty() {
-        s.push_str("\n## EXTERNAL PULLS (outside project)\n");
-        for e in &brief.external_pulls {
-            s.push_str(&format!(
-                "- {} — {} [verified_safe={}]\n",
-                e.path,
-                e.why,
-                if e.verified_safe { "yes" } else { "no" }
-            ));
-        }
-    }
-
-    s.push_str("\n## VERIFIER AUDIT\n");
-    s.push_str(&format!(
-        "complete={} — {}",
-        if audit.complete { "yes" } else { "no" },
-        audit.summary.trim()
-    ));
-    if !audit.missing.is_empty() {
-        s.push_str("\nMissing: ");
-        s.push_str(&audit
-            .missing
-            .iter()
-            .map(|g| format!("{} ({})", g.what, g.where_path))
-            .collect::<Vec<_>>()
-            .join("; "));
-    }
-    s
-}
-
 /// Formats a timestamp as ISO 8601 with local timezone offset, or "unknown".
 fn format_ts(ts: Option<chrono::DateTime<chrono::Local>>) -> String {
     match ts {
@@ -4514,33 +4417,7 @@ snake_case, rusqlite with Arc<Mutex>
         assert!(ok);
     }
 
-    #[test]
-    fn test_format_brief_digest_contains_sections() {
-        let brief = ResearchBrief {
-            summary: "do the thing".into(),
-            key_files: vec![BriefFile {
-                path: "src/lib.rs".into(),
-                why: "entry".into(),
-                key_symbols: vec!["main".into()],
-            }],
-            relevant_snippets: vec![],
-            conventions: "use snake_case".into(),
-            risks_unknowns: vec!["untested".into()],
-            external_pulls: vec![],
-        };
-        let audit = ContextAudit {
-            complete: true,
-            summary: "all good".into(),
-            missing: vec![],
-        };
-        let digest = format_brief_digest(&brief, &audit);
-        assert!(digest.contains("do the thing"));
-        assert!(digest.contains("src/lib.rs"));
-        assert!(digest.contains("main"));
-        assert!(digest.contains("use snake_case"));
-        assert!(digest.contains("untested"));
-        assert!(digest.contains("VERIFIER AUDIT"));
-    }
+
 
     #[test]
     fn test_build_tree_diff_report_detects_change_and_creation() {
