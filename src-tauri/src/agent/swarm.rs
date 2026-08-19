@@ -1581,7 +1581,9 @@ impl SwarmOrchestrator {
                 }
             }
             if let Some(plan) = this_plan {
-                let md = raw_plan_doc.clone().unwrap_or_else(|| render_plan_markdown(&plan));
+                let plan_path = project_root.join(".kuda").join("plan.md");
+                let disk_raw = std::fs::read_to_string(&plan_path).ok().filter(|s| !s.trim().is_empty());
+                let md = disk_raw.or(raw_plan_doc.clone()).unwrap_or_else(|| render_plan_markdown(&plan));
                 if last_draft_md.as_deref() == Some(md.as_str()) {
                     // The rewrite left the plan identical — applying the notes
                     // made no difference, so further rounds would not converge.
@@ -1590,8 +1592,8 @@ impl SwarmOrchestrator {
                     );
                     break;
                 }
-                last_draft_md = Some(md);
-                raw_draft_doc = raw_plan_doc;
+                last_draft_md = Some(md.clone());
+                raw_draft_doc = Some(md);
                 draft_plan = Some(plan);
             }
 
@@ -1602,8 +1604,10 @@ impl SwarmOrchestrator {
                 // Unreachable: a draft exists whenever we reach the review.
                 break;
             };
-            let rendered_fallback = render_plan_markdown(current_plan);
-            let plan_md = raw_draft_doc.as_deref().unwrap_or(&rendered_fallback);
+            let plan_path = project_root.join(".kuda").join("plan.md");
+            let disk_raw = std::fs::read_to_string(&plan_path).ok().filter(|s| !s.trim().is_empty());
+            let plan_md_owned = disk_raw.or_else(|| raw_draft_doc.clone()).unwrap_or_else(|| render_plan_markdown(current_plan));
+            let plan_md = plan_md_owned.as_str();
             emit(AgentEventKind::PhaseStarted {
                 role: AgentRole::Thinker.key().to_string(),
                 label: if review_rounds == 0 {
@@ -1788,12 +1792,14 @@ impl SwarmOrchestrator {
                 // UI disables revise/review once `round >= MAX_PLAN_GATE_ROUNDS`,
                 // matching the backend's `can_modify` below.
                 let round = gate_rounds;
-                let plan_md = render_plan_markdown(&final_plan);
+                let plan_file_path = ".kuda/plan.md".to_string();
+                let plan_path = project_root.join(&plan_file_path);
+                let disk_raw = std::fs::read_to_string(&plan_path).ok().filter(|s| !s.trim().is_empty());
+                let plan_md = disk_raw.unwrap_or_else(|| render_plan_markdown(&final_plan));
                 // Persist the current plan to a reviewable artifact in the
                 // project so the user can open it in the editor.
-                let plan_file_path = ".kuda/plan.md".to_string();
                 if let Ok(canon) =
-                    PathGuard::validate_path_in_scope(&project_root.join(&plan_file_path), &project_root)
+                    PathGuard::validate_path_in_scope(&plan_path, &project_root)
                 {
                     if let Some(parent) = canon.parent() {
                         let _ = std::fs::create_dir_all(parent);
@@ -2568,7 +2574,9 @@ impl SwarmOrchestrator {
                 break;
             }
             // ── Reviewer utama: audit the finished plan (read-only) ───────
-            let plan_md = render_plan_markdown(&final_plan);
+            let plan_path = project_root.join(".kuda").join("plan.md");
+            let disk_raw = std::fs::read_to_string(&plan_path).ok().filter(|s| !s.trim().is_empty());
+            let plan_md = disk_raw.unwrap_or_else(|| render_plan_markdown(&final_plan));
             if last_plan_md.as_deref() == Some(plan_md.as_str()) {
                 // The rewrite did not change the plan since the last audit —
                 // the directions were not applied, so no further progress is
