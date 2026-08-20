@@ -141,6 +141,7 @@ export const SettingsModal: React.FC = () => {
     thinker: { provider_id: '', model: '' },
     reviewers: [{ provider_id: '', model: '' }],
     planning_writer: { provider_id: '', model: '' },
+    plan_reviewer: { provider_id: '', model: '' },
     executor_code: { provider_id: '', model: '' },
     executor_design: { provider_id: '', model: '' },
     executor_reviewer: { provider_id: '', model: '' },
@@ -358,7 +359,7 @@ export const SettingsModal: React.FC = () => {
     try {
       const [agentCfg] = await Promise.all([ipc.agentConfigGet()]);
       await fetchProviders();
-      setAgent(agentCfg);
+      setAgent((prev) => ({ ...prev, ...agentCfg }));
       try {
         setHubAccount(await ipc.agentHubAccount());
       } catch {
@@ -489,6 +490,7 @@ export const SettingsModal: React.FC = () => {
         thinker: agent.thinker,
         reviewers: agent.reviewers.filter((r) => r.provider_id.trim()),
         planning_writer: agent.planning_writer,
+        plan_reviewer: agent.plan_reviewer || { provider_id: '', model: '' },
         executor_code: agent.executor_code,
         executor_design: agent.executor_design,
         executor_reviewer: agent.executor_reviewer,
@@ -758,8 +760,9 @@ export const SettingsModal: React.FC = () => {
               <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6, marginTop: 12 }}>
                 Planning & Execution
               </div>
-              <RoleRow title="Thinker" hint="direction + plan review" value={agent.thinker} onChange={(p) => setAgentRef('thinker', p)} uid="thinker" roleKey="thinker" />
+              <RoleRow title="Thinker" hint="strategic direction & design" value={agent.thinker} onChange={(p) => setAgentRef('thinker', p)} uid="thinker" roleKey="thinker" />
               <RoleRow title="Planning Writer" hint="drafts the full plan (cheap)" value={agent.planning_writer} onChange={(p) => setAgentRef('planning_writer', p)} uid="planning_writer" roleKey="planning_writer" />
+              <RoleRow title="Plan Reviewer" hint="reviews draft & evaluates audit" value={agent.plan_reviewer || { provider_id: '', model: '' }} onChange={(p) => setAgentRef('plan_reviewer', p)} uid="plan_reviewer" roleKey="plan_reviewer" />
               <RoleRow title="Executor Code" hint="code edits" value={agent.executor_code} onChange={(p) => setAgentRef('executor_code', p)} uid="exec_code" roleKey="executor_code" />
               <RoleRow title="Executor Design" hint="UI / CSS edits" value={agent.executor_design} onChange={(p) => setAgentRef('executor_design', p)} uid="exec_design" roleKey="executor_design" />
               <RoleRow title="Executor Reviewer" hint="verifies applied changes" value={agent.executor_reviewer} onChange={(p) => setAgentRef('executor_reviewer', p)} uid="exec_reviewer" roleKey="executor_reviewer" />

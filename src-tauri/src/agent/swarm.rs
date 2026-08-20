@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
 use crate::error::{AppError, Result};
@@ -1126,14 +1126,10 @@ impl SwarmOrchestrator {
         });
         let direction_prompt = format!(
             "{}\n\nDIRECTION CHECKPOINT (STAGE A — FIRST): you are asked ONLY for your \
-             temporary conclusion right now. Do NOT write .kuda/plan.md, do NOT call \
-             submit_plan. You rely 100% on the validated research brief. If the plan needs \
-             a concrete fact, config value, or file content the brief lacks, call request_rlm_research \
-             (at most twice per run) so the RLM researcher collects it for you. Write a TEMPORARY \
-             CONCLUSION as your response text: restate the goal in one line, summarize the \
-             chosen approach in 2-4 short bullets, list the main files to be touched, and \
-             note key risks/assumptions. The user reads this in the agent window and approves \
-             your direction before you create the full plan. If the request needs NO file \
+             temporary conclusion right now. Tulis KESIMPULAN SEMENTARA (~5-8 baris: goal, approach dalam 2-4 poin, file utama \
+             yang akan disentuh, risiko/asumsi) sekarang. JANGAN menulis .kuda/plan/plan.md, JANGAN \
+             memanggil submit_plan, JANGAN membuat daftar task detail. The user reads this in the agent window and approves \
+             your direction before the full plan is created. If the request needs NO file \
              changes, begin your conclusion with exactly: NO_FILE_CHANGES",
             PromptComposer::compose_role_prompt(AgentRole::Thinker, &project_root)
         );
@@ -1426,7 +1422,7 @@ impl SwarmOrchestrator {
             )
         };
         let prompt_to_writer = format!(
-            "{}Sekarang buat FULL plan ke .kuda/plan.md lalu panggil submit_plan.",
+            "{}Sekarang buat FULL plan ke .kuda/plan/plan.md lalu panggil submit_plan.",
             direction_ctx
         );
         shared.push(Message::user(prompt_to_writer.clone()));
@@ -1484,8 +1480,8 @@ impl SwarmOrchestrator {
         // final approved plan enters `shared`.
         let planning_writer_provider =
             resolve_role_provider(AgentRole::PlanningWriter, &app_data_dir).await?;
-        let thinker_provider =
-            resolve_role_provider(AgentRole::Thinker, &app_data_dir).await?;
+        let plan_reviewer_provider =
+            resolve_role_provider(AgentRole::PlanReviewer, &app_data_dir).await?;
 
         emit(AgentEventKind::PhaseStarted {
             role: AgentRole::PlanningWriter.key().to_string(),
@@ -1587,7 +1583,7 @@ impl SwarmOrchestrator {
                 }
             }
             if let Some(plan) = this_plan {
-                let plan_path = project_root.join(".kuda").join("plan.md");
+                let (plan_path, _) = resolve_plan_path(&project_root);
                 let disk_raw = std::fs::read_to_string(&plan_path).ok().filter(|s| !s.trim().is_empty());
                 let md = disk_raw.or(raw_plan_doc.clone()).unwrap_or_else(|| render_plan_markdown(&plan));
                 if last_draft_md.as_deref() == Some(md.as_str()) {
@@ -1603,47 +1599,46 @@ impl SwarmOrchestrator {
                 draft_plan = Some(plan);
             }
 
-            // ── Thinker review: READ the draft + emit a tiny decision ──────
+            // ── Plan Reviewer: READ the draft + emit a tiny decision ──────
             // PRIVATE review context (shared + the draft); never written back
             // into `shared`, so the review turns do not bloat later turns.
             let Some(ref current_plan) = draft_plan else {
                 // Unreachable: a draft exists whenever we reach the review.
                 break;
             };
-            let plan_path = project_root.join(".kuda").join("plan.md");
+            let (plan_path, _) = resolve_plan_path(&project_root);
             let disk_raw = std::fs::read_to_string(&plan_path).ok().filter(|s| !s.trim().is_empty());
             let plan_md_owned = disk_raw.or_else(|| raw_draft_doc.clone()).unwrap_or_else(|| render_plan_markdown(current_plan));
             let plan_md = plan_md_owned.as_str();
             emit(AgentEventKind::PhaseStarted {
-                role: AgentRole::Thinker.key().to_string(),
+                role: AgentRole::PlanReviewer.key().to_string(),
                 label: if review_rounds == 0 {
-                    "Thinker: reviewing draft plan".to_string()
+                    "Plan Reviewer: reviewing draft plan".to_string()
                 } else {
-                    format!("Thinker: reviewing draft plan (round {})", review_rounds + 1)
+                    format!("Plan Reviewer: reviewing draft plan (round {})", review_rounds + 1)
                 },
-                model: thinker_provider.name().to_string(),
+                model: plan_reviewer_provider.name().to_string(),
             });
             let review_prompt = format!(
-                "{}\n\nPLAN REVIEW MODE (STAGE B): The Planning Writer drafted the full plan \
-                 below by expanding YOUR approved direction. You did NOT write it. READ it \
-                 carefully and check it matches your intended design: the goal, the \
+                "{}\n\nPLAN REVIEW MODE: The Planning Writer drafted the full plan \
+                 below based on the approved direction. You did NOT write it. READ it \
+                 carefully and check it matches the intended design: the goal, the \
                  architecture, the chosen files, the task split, and the exact anchors/values.\n\n\
                  CRITICAL EFFICIENCY & DECISION RULES:\n\
-                 1. Be DECISIVE, FOCUSED, and CONCISE. Do NOT over-analyze hypothetical internal crate \
-                    mechanics or write long internal essays.\n\
+                 1. Be DECISIVE, FOCUSED, and CONCISE.\n\
                  2. Verify the core concrete checklist: files, cargo dependencies, endpoints, database \
                     schema/options, and error handling.\n\
-                 3. If the plan matches your direction and is executable, APPROVE IT IMMEDIATELY without \
+                 3. If the plan matches the direction and is executable, APPROVE IT IMMEDIATELY without \
                     hesitation (set \"approved\": true).\n\
                  4. Only reject (set \"approved\": false) if there is a fatal compilation error or breaking \
                     logic gap. If rejecting, list all concrete bullet fixes concisely so the Planning \
                     Writer can apply all surgical fixes in ONE single pass.\n\
                  5. Call submit_plan_review exactly once in turn 1.",
-                PromptComposer::compose_role_prompt(AgentRole::Thinker, &project_root)
+                PromptComposer::compose_role_prompt(AgentRole::PlanReviewer, &project_root)
             );
             let mut review_ctx: Vec<Message> = shared.clone();
             review_ctx.push(Message::user(format!(
-                "[DRAFT PLAN written by the Planning Writer — review it against your approved \
+                "[DRAFT PLAN written by the Planning Writer — review it against the approved \
                  direction and the brief]:\n{}",
                 plan_md
             )));
@@ -1654,11 +1649,11 @@ impl SwarmOrchestrator {
                         system_prompt: review_prompt,
                         messages: review_ctx,
                         allowed_tools: &["submit_plan_review".to_string()],
-                        provider: thinker_provider.clone(),
+                        provider: plan_reviewer_provider.clone(),
                         max_turns: 2,
-                        temperature: 0.2,
+                        temperature: 0.1,
                         stop_on_tool: Some("submit_plan_review"),
-                        role_name: "thinker (plan review)",
+                        role_name: "plan reviewer (draft review)",
                     },
                     tool_ctx,
                     auto_approve,
@@ -1674,7 +1669,7 @@ impl SwarmOrchestrator {
             planner_phase_tokens_out += review_outcome.tokens_out;
             let (approved, revision_notes) = parse_plan_review(&review_outcome.stop_tool_args);
             emit(AgentEventKind::PhaseCompleted {
-                role: AgentRole::Thinker.key().to_string(),
+                role: AgentRole::PlanReviewer.key().to_string(),
                 summary: if approved {
                     "Draft plan approved".to_string()
                 } else {
@@ -1694,11 +1689,11 @@ impl SwarmOrchestrator {
             }
             let notes_str = revision_notes.clone().unwrap_or_default();
             if last_revision_notes.as_deref() == Some(notes_str.as_str()) {
-                // The Thinker repeated the exact same revisions — no new
+                // The Plan Reviewer repeated the exact same revisions — no new
                 // information, so further rounds would just oscillate. Accept
                 // the latest draft.
                 tracing::info!(
-                    "Thinker plan review repeated identical revision notes; accepting the draft"
+                    "Plan Reviewer repeated identical revision notes; accepting the draft"
                 );
                 break;
             }
@@ -1713,9 +1708,9 @@ impl SwarmOrchestrator {
             }
             // Feed the revision notes back into the writer's PRIVATE context.
             writer_ctx.push(Message::user(format!(
-                "[THINKER REVISION REQUEST] The Thinker reviewed your plan and asks for these \
-                 corrections. Apply these fixes by SURGICALLY EDITING \".kuda/plan.md\" using \
-                 multi_replace_file (do not rewrite the whole file), then call submit_plan again:\n{}",
+                "[PLAN REVIEWER REVISION REQUEST] The Plan Reviewer reviewed your plan and asks for these \
+                 corrections. Apply these fixes by SURGICALLY EDITING \".kuda/plan/plan.md\" using \
+                 multi_replace_file (do not rewrite the whole file), then call submit_plan with {{\"file_path\": \".kuda/plan/plan.md\"}}:\n{}",
                 revision_notes.unwrap_or_default()
             )));
             emit(AgentEventKind::PhaseStarted {
@@ -1732,43 +1727,20 @@ impl SwarmOrchestrator {
             AppError::General("Planning Writer produced no plan.".to_string())
         })?;
 
-        // ── Reviewer utama (WAJIB) setelah plan selesai dibuat ────────────
-        // Reviewer utama (Kimi-K3, read-only) mengaudit plan yang sudah jadi:
-        // mencari bug / kesalahan logika / kekurangan & hal yang bisa
-        // ditingkatkan. Arahannya dikirim ke Thinker, yang memutuskan revisi,
-        // lalu Planning Writer menulis ulang. Berulang sampai Reviewer utama
-        // menyetujui (cap lama dihapus; guard no-progress mencegah oscilasi).
-        let reviewer_base_ctx = if !thinker_history.is_empty() {
-            &thinker_history
-        } else {
-            &shared
-        };
-        let mut final_plan = self
-            .run_reviewer_improvement_loop(
-                reviewer_base_ctx,
-                &draft_plan,
-                &project_root,
-                &app_data_dir,
-                tool_ctx,
-                auto_approve,
-                &emit,
-                &mut total_tokens,
-                &mut total_tokens_in,
-                &mut total_tokens_out,
-                &mut total_cached_in,
-            )
-            .await?;
+        // Plan is verified by Plan Reviewer. Reviewer utama is OPTIONAL:
+        // the user chooses at the Plan Gate whether to execute immediately
+        // (saving smart-tier tokens) or request a Reviewer utama audit.
+        let mut final_plan = draft_plan;
 
         // Only the final approved plan enters the shared context — the entire
         // writer/review loop stays private so it never bloats later turns.
         shared.push(Message::user(format!(
-            "[PLAN] Final plan — drafted by the Planning Writer and audited by the \
-             Reviewer utama:\n{}",
+            "[PLAN] Plan drafted by Planning Writer and verified by Plan Reviewer:\n{}",
             truncate_chars(&render_plan_markdown(&final_plan), 8000)
         )));
         emit(AgentEventKind::PhaseCompleted {
-            role: AgentRole::Thinker.key().to_string(),
-            summary: format!("Draft plan: {} task(s)", final_plan.tasks.len()),
+            role: AgentRole::PlanningWriter.key().to_string(),
+            summary: format!("Draft plan ready: {} task(s)", final_plan.tasks.len()),
             tokens_in: planner_phase_tokens_in,
             tokens_out: planner_phase_tokens_out,
             cached_in: planner_phase_cached_in,
@@ -1798,8 +1770,7 @@ impl SwarmOrchestrator {
                 // UI disables revise/review once `round >= MAX_PLAN_GATE_ROUNDS`,
                 // matching the backend's `can_modify` below.
                 let round = gate_rounds;
-                let plan_file_path = ".kuda/plan.md".to_string();
-                let plan_path = project_root.join(&plan_file_path);
+                let (plan_path, plan_file_path) = resolve_plan_path(&project_root);
                 let disk_raw = std::fs::read_to_string(&plan_path).ok().filter(|s| !s.trim().is_empty());
                 let plan_md = disk_raw.unwrap_or_else(|| render_plan_markdown(&final_plan));
                 // Persist the current plan to a reviewable artifact in the
@@ -1848,26 +1819,42 @@ impl SwarmOrchestrator {
                         revisions += 1;
                         latest_note = decision.1;
                         let note_text = latest_note.clone().unwrap_or_default();
+                        let planning_writer_provider =
+                            resolve_role_provider(AgentRole::PlanningWriter, &app_data_dir).await?;
+                        let writer_spec = AgentRole::PlanningWriter.spec();
+                        let (plan_path, plan_file_path) = resolve_plan_path(&project_root);
+                        let disk_raw = std::fs::read_to_string(&plan_path).ok().filter(|s| !s.trim().is_empty());
+                        let plan_md = disk_raw.unwrap_or_else(|| render_plan_markdown(&final_plan));
+
+                        emit(AgentEventKind::PhaseStarted {
+                            role: AgentRole::PlanningWriter.key().to_string(),
+                            label: format!("Planning Writer: merevisi plan per instruksi user (revisi #{})", revisions),
+                            model: planning_writer_provider.name().to_string(),
+                        });
+
                         let mut revise_ctx = shared.clone();
                         revise_ctx.push(Message::user(format!(
-                            "[USER PLAN REVISION] The user wants these changes to the plan:\n{}\n\
-                             Revise the plan accordingly using the same plan template, then call \
-                             submit_plan exactly once with {{\"file_path\": \".kuda/plan.md\"}}.",
-                            note_text
+                            "[PLAN SAAT INI]\n{}\n\n[USER PLAN REVISION REQUEST] The user reviewed the plan and asks for these specific corrections:\n{}\n\
+                             Apply these fixes by SURGICALLY EDITING \"{}\" using `multi_replace_file` \
+                             (or `write_file` if completely rewriting), then call submit_plan with {{\"file_path\": \"{}\"}}.",
+                            plan_md,
+                            note_text,
+                            plan_file_path,
+                            plan_file_path
                         )));
-                        let thinker_spec = AgentRole::Thinker.spec();
+
                         let revise_outcome = self
                             .inner
                             .run_role_loop(
                                 RoleLoopParams {
-                                    system_prompt: PromptComposer::compose_role_prompt(AgentRole::Thinker, &project_root),
+                                    system_prompt: PromptComposer::compose_role_prompt(AgentRole::PlanningWriter, &project_root),
                                     messages: revise_ctx,
-                                    allowed_tools: &thinker_spec.allowed_tools,
-                                    provider: thinker_provider.clone(),
-                                    max_turns: thinker_spec.max_turns,
-                                    temperature: thinker_spec.temperature,
+                                    allowed_tools: &writer_spec.allowed_tools,
+                                    provider: planning_writer_provider.clone(),
+                                    max_turns: writer_spec.max_turns,
+                                    temperature: writer_spec.temperature,
                                     stop_on_tool: Some("submit_plan"),
-                                    role_name: "thinker (plan revision)",
+                                    role_name: "planning writer (revisi user)",
                                 },
                                 tool_ctx,
                                 auto_approve,
@@ -1878,20 +1865,30 @@ impl SwarmOrchestrator {
                         total_tokens_in += revise_outcome.tokens_in;
                         total_cached_in += revise_outcome.cached_in;
                         total_tokens_out += revise_outcome.tokens_out;
+
                         if let Some(args) = &revise_outcome.stop_tool_args {
                             if let Ok(doc) = handoff_doc(&project_root, args, &revise_outcome.final_text) {
                                 if let Ok(plan) = parse_plan_doc(&doc) {
                                     final_plan = plan;
                                 }
                             }
+                        } else if let Ok(doc) = std::fs::read_to_string(&plan_path) {
+                            if let Ok(plan) = parse_plan_doc(&doc) {
+                                final_plan = plan;
+                            }
                         }
+
+                        emit(AgentEventKind::PhaseCompleted {
+                            role: AgentRole::PlanningWriter.key().to_string(),
+                            summary: format!("Plan direvisi: {} task(s)", final_plan.tasks.len()),
+                            tokens_in: revise_outcome.tokens_in,
+                            tokens_out: revise_outcome.tokens_out,
+                            cached_in: revise_outcome.cached_in,
+                        });
+
                         // Keep `shared` consistent with the plan executors will
                         // actually run: the old `[PLAN]` was the pre-revision
-                        // draft. Pushing a fresh `[PLAN]` (instead of replacing
-                        // `shared` with the Thinker's private revision history,
-                        // which used to leak the whole private loop into every
-                        // later executor/reviewer turn) keeps one authoritative
-                        // plan in context.
+                        // draft. Refresh the `[PLAN]` block.
                         shared.push(Message::user(format!(
                             "[PLAN] Plan direvisi sesuai instruksi user:\n{}",
                             truncate_chars(&render_plan_markdown(&final_plan), 8000)
@@ -1963,9 +1960,8 @@ impl SwarmOrchestrator {
                 format!("approved (review×{}, revision×{})", reviews, revisions)
             });
         } else {
-            // Gate off → the Reviewer utama already ran right after the plan was
-            // created (mandatory), so nothing extra happens here.
-            plan_status_str = Some("auto (gate off, reviewer utama sudah jalan)".to_string());
+            // Gate off → user disabled gate in settings, plan execution proceeds directly.
+            plan_status_str = Some("auto (gate off, eksekusi langsung)".to_string());
         }
 
         // Record the approved/revised plan + status into the turn's ledger.
@@ -2067,7 +2063,7 @@ impl SwarmOrchestrator {
                 } else {
                     shared.clone()
                 };
-                exec_history.push(Message::user(build_executor_brief(&approved_plan, task)));
+                exec_history.push(Message::user(build_executor_brief(&project_root, &approved_plan, task)));
 
                 // Snapshot the WHOLE project tree BEFORE execution so the diff
                 // report catches every change the executor makes — including
@@ -2388,6 +2384,7 @@ impl SwarmOrchestrator {
     /// Runs a single no-tool Thinker turn that writes the best possible final
     /// answer from the shared context. Used when planning fails or exhausts its
     /// turns, so the swarm degrades gracefully instead of aborting the run.
+    #[allow(dead_code)]
     async fn synthesize_answer_from_context(
         &self,
         shared: Vec<Message>,
@@ -2516,10 +2513,10 @@ impl SwarmOrchestrator {
         ))
     }
 
-    /// Mandatory Reviewer-utama improvement loop, run right after the plan is
-    /// finished. The Reviewer (smart model, read-only) audits the plan for bugs /
-    /// logic errors / missing depth and returns DIRECTIONS via
-    /// `submit_review_directions` (never writes files). The Thinker evaluates
+    /// Reviewer-utama improvement loop, run on-demand when requested by the user
+    /// at the Plan Approval Gate. The Reviewer (smart model, read-only) audits
+    /// the plan for bugs / logic errors / missing depth and returns DIRECTIONS via
+    /// `submit_review_directions` (never writes files). The Plan Reviewer evaluates
     /// each direction and turns it into concrete revision notes, then the
     /// Planning Writer rewrites the plan. Loops (bounded) until the Reviewer
     /// approves.
@@ -2539,11 +2536,12 @@ impl SwarmOrchestrator {
         total_cached_in: &mut usize,
     ) -> Result<SwarmPlan> {
         let reviewer_provider = resolve_role_provider(AgentRole::Reviewer, app_data_dir).await?;
-        let thinker_provider = resolve_role_provider(AgentRole::Thinker, app_data_dir).await?;
+        let plan_reviewer_provider =
+            resolve_role_provider(AgentRole::PlanReviewer, app_data_dir).await?;
         let writer_provider =
             resolve_role_provider(AgentRole::PlanningWriter, app_data_dir).await?;
         let reviewer_spec = AgentRole::Reviewer.spec();
-        let thinker_spec = AgentRole::Thinker.spec();
+        let plan_reviewer_spec = AgentRole::PlanReviewer.spec();
         let writer_spec = AgentRole::PlanningWriter.spec();
 
         let mut final_plan = plan.clone();
@@ -2561,7 +2559,7 @@ impl SwarmOrchestrator {
                 break;
             }
             // ── Reviewer utama: audit the finished plan (read-only) ───────
-            let plan_path = project_root.join(".kuda").join("plan.md");
+            let (plan_path, _) = resolve_plan_path(project_root);
             let disk_raw = std::fs::read_to_string(&plan_path).ok().filter(|s| !s.trim().is_empty());
             let plan_md = disk_raw.unwrap_or_else(|| render_plan_markdown(&final_plan));
             if last_plan_md.as_deref() == Some(plan_md.as_str()) {
@@ -2656,14 +2654,14 @@ impl SwarmOrchestrator {
             }
             last_directions = Some(dirs_key);
 
-            // ── Thinker: evaluate the reviewer's directions → revision notes ──
+            // ── Plan Reviewer: evaluate the reviewer's directions → revision notes ──
             emit(AgentEventKind::PhaseStarted {
-                role: AgentRole::Thinker.key().to_string(),
-                label: format!("Thinker: evaluasi arahan Reviewer (round {})", round + 1),
-                model: thinker_provider.name().to_string(),
+                role: AgentRole::PlanReviewer.key().to_string(),
+                label: format!("Plan Reviewer: evaluasi arahan Reviewer (round {})", round + 1),
+                model: plan_reviewer_provider.name().to_string(),
             });
-            let mut thinker_ctx: Vec<Message> = shared.to_vec();
-            thinker_ctx.push(Message::user(format!(
+            let mut eval_ctx: Vec<Message> = shared.to_vec();
+            eval_ctx.push(Message::user(format!(
                 "[PLAN SAAT INI]\n{}\n\n[ARAHAN REVIEWER UTAMA]\n{}\nEvaluasi SETIAP arahan: \
                  mana yang benar dan layak diterapkan, mana yang Anda tolak beserta alasan. \
                  JANGAN menulis ulang plan. Panggil submit_plan_review: \"approved\"=true bila \
@@ -2677,7 +2675,7 @@ impl SwarmOrchestrator {
                     .collect::<Vec<_>>()
                     .join("\n")
             )));
-            let thinker_eval_outcome = self
+            let eval_outcome = self
                 .inner
                 .run_role_loop(
                     RoleLoopParams {
@@ -2685,53 +2683,58 @@ impl SwarmOrchestrator {
                             "{}\n\nREVIEWER-FEEDBACK EVALUATION: decide which reviewer \
                              directions to accept and turn them into concrete revision notes. \
                              You do NOT write the plan — the Planning Writer does.",
-                            PromptComposer::compose_role_prompt(AgentRole::Thinker, project_root)
+                            PromptComposer::compose_role_prompt(AgentRole::PlanReviewer, project_root)
                         ),
-                        messages: thinker_ctx,
-                        allowed_tools: &["submit_plan_review".to_string()],
-                        provider: thinker_provider.clone(),
+                        messages: eval_ctx,
+                        allowed_tools: &plan_reviewer_spec.allowed_tools,
+                        provider: plan_reviewer_provider.clone(),
                         max_turns: 2,
-                        temperature: thinker_spec.temperature,
+                        temperature: plan_reviewer_spec.temperature,
                         stop_on_tool: Some("submit_plan_review"),
-                        role_name: "thinker (evaluasi arahan reviewer)",
+                        role_name: "plan reviewer (evaluasi arahan reviewer)",
                     },
                     tool_ctx,
                     auto_approve,
                     emit,
                 )
                 .await?;
-            *total_tokens += thinker_eval_outcome.tokens_used;
-            *total_tokens_in += thinker_eval_outcome.tokens_in;
-            *total_cached_in += thinker_eval_outcome.cached_in;
-            *total_tokens_out += thinker_eval_outcome.tokens_out;
-            let (thinker_approved, notes) = parse_plan_review(&thinker_eval_outcome.stop_tool_args);
+            *total_tokens += eval_outcome.tokens_used;
+            *total_tokens_in += eval_outcome.tokens_in;
+            *total_cached_in += eval_outcome.cached_in;
+            *total_tokens_out += eval_outcome.tokens_out;
+            let (eval_approved, notes) = parse_plan_review(&eval_outcome.stop_tool_args);
             emit(AgentEventKind::PhaseCompleted {
-                role: AgentRole::Thinker.key().to_string(),
-                summary: if thinker_approved {
-                    "Thinker menilai arahan Reviewer tidak perlu diterapkan".to_string()
+                role: AgentRole::PlanReviewer.key().to_string(),
+                summary: if eval_approved {
+                    "Plan Reviewer menilai arahan Reviewer tidak perlu diterapkan".to_string()
                 } else {
-                    "Thinker menyetujui revisi — dikirim ke Planning Writer".to_string()
+                    "Plan Reviewer menyetujui revisi — dikirim ke Planning Writer".to_string()
                 },
-                tokens_in: thinker_eval_outcome.tokens_in,
-                tokens_out: thinker_eval_outcome.tokens_out,
-                cached_in: thinker_eval_outcome.cached_in,
+                tokens_in: eval_outcome.tokens_in,
+                tokens_out: eval_outcome.tokens_out,
+                cached_in: eval_outcome.cached_in,
             });
-            if thinker_approved || notes.is_none() {
+            if eval_approved || notes.is_none() {
                 break;
             }
 
-            // ── Planning Writer: rewrite the plan per the Thinker's notes ──
+            // ── Planning Writer: rewrite the plan per the Plan Reviewer's notes ──
             let notes = notes.unwrap_or_default();
+            let (plan_path, plan_file_path) = resolve_plan_path(project_root);
+            let disk_raw = std::fs::read_to_string(&plan_path).ok().filter(|s| !s.trim().is_empty());
+            let plan_md = disk_raw.unwrap_or_else(|| render_plan_markdown(&final_plan));
             let mut writer_ctx: Vec<Message> = shared.to_vec();
             writer_ctx.push(Message::user(format!(
                 "[PLAN SAAT INI]\n{}",
                 plan_md
             )));
             writer_ctx.push(Message::user(format!(
-                "[THINKER REVISION REQUEST — berdasarkan arahan Reviewer utama] Terapkan \
-                 koreksi berikut dengan mengedit .kuda/plan.md secara SURGICAL menggunakan \
+                "[PLAN REVIEWER REVISION REQUEST — berdasarkan arahan Reviewer utama] Terapkan \
+                 koreksi berikut dengan mengedit {} secara SURGICAL menggunakan \
                  multi_replace_file (jangan tulis ulang seluruh file), lalu panggil \
-                 submit_plan dengan {{\"file_path\": \".kuda/plan.md\"}}:\n{}",
+                 submit_plan dengan {{\"file_path\": \"{}\"}}:\n{}",
+                plan_file_path,
+                plan_file_path,
                 notes
             )));
             emit(AgentEventKind::PhaseStarted {
@@ -2833,13 +2836,12 @@ fn parse_brief(args_json: &str) -> Result<ResearchBrief> {
         .map_err(|e| AppError::General(format!("Invalid brief JSON: {}", e)))
 }
 
-/// Parses the Thinker's `submit_plan_review` handoff args into
-/// `(approved, revision_notes)`. The Thinker runs in PLAN REVIEW MODE inside
-/// the Planning Writer loop: it READS the draft and emits only this tiny
-/// decision (never rewrites the plan). Defaults to `(true, None)` when the
-/// args are missing, malformed, or reject without actionable notes, so a
-/// non-decision never loops forever — the plan gate still lets the user
-/// revise afterward.
+/// Parses the `submit_plan_review` handoff args into `(approved, revision_notes)`.
+/// The Plan Reviewer runs in PLAN REVIEW MODE inside the Planning Writer loop:
+/// it READS the draft and emits only this tiny decision (never rewrites the plan).
+/// Defaults to `(true, None)` when the args are missing, malformed, or reject
+/// without actionable notes, so a non-decision never loops forever — the plan
+/// gate still lets the user revise afterward.
 fn parse_plan_review(args_json: &Option<String>) -> (bool, Option<String>) {
     let Some(args) = args_json else {
         return (true, None);
@@ -2937,6 +2939,23 @@ fn looks_like_handoff_doc(text: &str) -> bool {
     })
 }
 
+/// Resolves the plan markdown file location. Prefers the modular path
+/// `.kuda/plan/plan.md` (and creates it), falling back to legacy `.kuda/plan.md`
+/// if an existing project already has one.
+pub fn resolve_plan_path(project_root: &Path) -> (PathBuf, String) {
+    let modular_rel = ".kuda/plan/plan.md";
+    let modular_abs = project_root.join(modular_rel);
+    if modular_abs.exists() {
+        return (modular_abs, modular_rel.to_string());
+    }
+    let legacy_rel = ".kuda/plan.md";
+    let legacy_abs = project_root.join(legacy_rel);
+    if legacy_abs.exists() {
+        return (legacy_abs, legacy_rel.to_string());
+    }
+    (modular_abs, modular_rel.to_string())
+}
+
 fn handoff_doc(project_root: &Path, args_json: &str, fallback_text: &str) -> Result<String> {
     let v: serde_json::Value =
         serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
@@ -3017,30 +3036,13 @@ async fn resolve_snippet_placeholders(project_root: &Path, doc: &str) -> String 
     let Some(proc) = guard.as_mut() else {
         return doc.to_string();
     };
-    // Dump the ENTIRE snippet bank as a single-line JSON object (json.dumps
-    // escapes newlines, so the stdout reader cannot split or corrupt it and the
-    // sentinel stays on its own line). One round-trip for all captures.
-    let code = "import json as _rj\nprint(_rj.dumps({str(_k): {'rel': _v['rel'], 'start': _v['start'], 'end': _v['end'], 'content': _v['content']} for _k, _v in _rlm_bank.items()}))\n";
-    let out = match proc.execute_code(code, 10).await {
-        Ok(o) => o,
+    let bank = match proc.dump_snippet_bank().await {
+        Ok(b) => b,
         Err(e) => {
             tracing::warn!("RLM snippet bank fetch failed: {}", e);
             return doc.to_string();
         }
     };
-    let json_line = out.lines().next().unwrap_or("");
-    let bank: std::collections::HashMap<String, serde_json::Value> =
-        match serde_json::from_str(json_line) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    "RLM snippet bank JSON unparseable ({}); got prefix: {:?}",
-                    e,
-                    &out[..out.len().min(160)]
-                );
-                return doc.to_string();
-            }
-        };
     let mut blocks: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
     for id in ids {
         let key = id.to_string();
@@ -3376,6 +3378,334 @@ fn parse_verdict_markdown(md: &str) -> Result<Verdict> {
     })
 }
 
+/// Deterministically splits a markdown list item into path/entity and rationale/location.
+/// Preserves Windows drive letters (`C:\...`) and handles standard markdown separators.
+fn split_path_and_rationale(raw: &str) -> (String, String) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (String::new(), String::new());
+    }
+
+    // Check if the string starts with a Windows drive letter (e.g., "C:\...", "D:/...")
+    let offset = if trimmed.len() >= 3
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+        && trimmed.as_bytes()[1] == b':'
+        && (trimmed.as_bytes()[2] == b'\\' || trimmed.as_bytes()[2] == b'/')
+    {
+        3
+    } else {
+        0
+    };
+
+    // Separators checked in priority order
+    let seps = [
+        " — ", " —", "— ", "—", " – ", " –", "– ", "–", " -- ", " - ", " : ", ": ",
+    ];
+    for sep in seps {
+        if let Some(pos) = trimmed[offset..].find(sep) {
+            let actual_idx = offset + pos;
+            let path = trimmed[..actual_idx].trim().to_string();
+            let why = trimmed[actual_idx + sep.len()..].trim().to_string();
+            if !path.is_empty() {
+                return (path, why);
+            }
+        }
+    }
+    (trimmed.to_string(), String::new())
+}
+
+/// Extracts symbols from trailing parenthetical string like `(symbols: a:1, b:2)` or `(symbol: a:1)`
+fn extract_symbols_metadata(tail: &str) -> Vec<String> {
+    let lower = tail.to_lowercase();
+    let prefix = if lower.starts_with("symbols:") {
+        Some(8)
+    } else if lower.starts_with("symbol:") {
+        Some(7)
+    } else if lower.starts_with("key symbols:") {
+        Some(12)
+    } else if lower.starts_with("symbols :") {
+        Some(9)
+    } else {
+        None
+    };
+
+    if let Some(p) = prefix {
+        tail[p..]
+            .trim_end_matches(')')
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Extracts "why needed" from trailing parenthetical string like `(needed for: ...)` or `(needed: ...)`
+fn extract_audit_needed_metadata(tail: &str) -> String {
+    let lower = tail.to_lowercase();
+    let prefix = if lower.starts_with("needed for:") {
+        Some(11)
+    } else if lower.starts_with("needed for :") {
+        Some(12)
+    } else if lower.starts_with("needed:") {
+        Some(7)
+    } else if lower.starts_with("needed :") {
+        Some(8)
+    } else {
+        None
+    };
+
+    if let Some(p) = prefix {
+        tail[p..].trim_end_matches(')').trim().to_string()
+    } else if let Some(end) = tail.find(')') {
+        tail[..end].trim().to_string()
+    } else {
+        tail.trim().to_string()
+    }
+}
+
+/// Decodes standard XML entities (&amp;, &lt;, &gt;, &quot;, &apos;).
+fn decode_xml_entities(input: &str) -> String {
+    input
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+/// Extracts inner content of `<tag_name>...</tag_name>`.
+fn extract_xml_tag_content<'a>(xml: &'a str, tag_name: &str) -> Option<&'a str> {
+    let open_prefix = format!("<{}", tag_name);
+    let close_tag = format!("</{}>", tag_name);
+    let start_pos = xml.find(&open_prefix)?;
+    let after_open = &xml[start_pos + open_prefix.len()..];
+    let tag_header_end = after_open.find('>')?;
+    let content_start = start_pos + open_prefix.len() + tag_header_end + 1;
+    let after_content = &xml[content_start..];
+    let end_pos = after_content.find(&close_tag)?;
+    Some(&xml[content_start..content_start + end_pos])
+}
+
+/// Extracts attribute value like `attr="val"` or `attr='val'` from a tag header string `<tag attr="val">`.
+fn extract_xml_attr(tag_header: &str, attr_name: &str) -> Option<String> {
+    let prefix_double = format!("{}=\"", attr_name);
+    let prefix_single = format!("{}='", attr_name);
+    if let Some(pos) = tag_header.find(&prefix_double) {
+        let after = &tag_header[pos + prefix_double.len()..];
+        if let Some(end) = after.find('"') {
+            return Some(decode_xml_entities(&after[..end]));
+        }
+    }
+    if let Some(pos) = tag_header.find(&prefix_single) {
+        let after = &tag_header[pos + prefix_single.len()..];
+        if let Some(end) = after.find('\'') {
+            return Some(decode_xml_entities(&after[..end]));
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RlmStructKeyFile {
+    pub id: Option<u64>,
+    pub path: Option<String>,
+    pub why: String,
+    pub symbols: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RlmStructMissing {
+    pub snippet_id: Option<u64>,
+    pub path: Option<String>,
+    pub what: String,
+    pub why_needed: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RlmStructData {
+    pub version: u32,
+    pub complete: Option<bool>,
+    pub summary: Option<String>,
+    pub key_files: Vec<RlmStructKeyFile>,
+    pub missing: Vec<RlmStructMissing>,
+}
+
+/// Deterministically parses the `---RLM_STRUCT_DATA_START---...<rlm_struct>...---RLM_STRUCT_DATA_END---` block.
+pub fn parse_rlm_struct_xml(text: &str) -> Option<RlmStructData> {
+    let start_marker = "---RLM_STRUCT_DATA_START---";
+    let end_marker = "---RLM_STRUCT_DATA_END---";
+    let block = if let (Some(s), Some(e)) = (text.find(start_marker), text.find(end_marker)) {
+        if s < e {
+            &text[s + start_marker.len()..e]
+        } else {
+            text
+        }
+    } else {
+        text
+    };
+
+    let rlm_struct_content = extract_xml_tag_content(block, "rlm_struct")
+        .or_else(|| extract_xml_tag_content(block, "rlm_data"))?;
+
+    let mut data = RlmStructData {
+        version: 1,
+        ..Default::default()
+    };
+
+    if let Some(sum) = extract_xml_tag_content(rlm_struct_content, "summary") {
+        data.summary = Some(decode_xml_entities(sum).trim().to_string());
+    }
+    if let Some(comp) = extract_xml_tag_content(rlm_struct_content, "complete") {
+        let c_lower = comp.trim().to_lowercase();
+        data.complete = Some(c_lower == "true" || c_lower == "1" || c_lower == "yes");
+    }
+
+    // Extract all <key_file ...>...</key_file>
+    let mut search_slice = rlm_struct_content;
+    let mut is_corrupt = false;
+    while let Some(open_idx) = search_slice.find("<key_file") {
+        let after_open = &search_slice[open_idx..];
+        let tag_header_end = match after_open.find('>') {
+            Some(i) => i,
+            None => {
+                is_corrupt = true;
+                break;
+            }
+        };
+        let tag_header = &after_open[..tag_header_end];
+        let close_tag = "</key_file>";
+        let close_idx = match after_open.find(close_tag) {
+            Some(i) => i,
+            None => {
+                is_corrupt = true;
+                break;
+            }
+        };
+        let inner_xml = &after_open[tag_header_end + 1..close_idx];
+
+        let id = extract_xml_attr(tag_header, "id")
+            .or_else(|| extract_xml_attr(tag_header, "snippet_id"))
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        let path = extract_xml_attr(tag_header, "path");
+
+        let why = extract_xml_tag_content(inner_xml, "why")
+            .map(|s| decode_xml_entities(s).trim().to_string())
+            .unwrap_or_default();
+
+        let symbols = extract_xml_tag_content(inner_xml, "symbols")
+            .map(|s| {
+                decode_xml_entities(s)
+                    .split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        data.key_files.push(RlmStructKeyFile {
+            id,
+            path,
+            why,
+            symbols,
+        });
+
+        search_slice = &after_open[close_idx + close_tag.len()..];
+    }
+
+    // Extract all <missing ...>...</missing> or <gap ...>...</gap>
+    let mut search_slice = rlm_struct_content;
+    while let Some(open_idx) = search_slice.find("<missing").or_else(|| search_slice.find("<gap")) {
+        let after_open = &search_slice[open_idx..];
+        let tag_header_end = match after_open.find('>') {
+            Some(i) => i,
+            None => {
+                is_corrupt = true;
+                break;
+            }
+        };
+        let tag_header = &after_open[..tag_header_end];
+        let close_tag = if tag_header.starts_with("<missing") {
+            "</missing>"
+        } else {
+            "</gap>"
+        };
+        let close_idx = match after_open.find(close_tag) {
+            Some(i) => i,
+            None => {
+                is_corrupt = true;
+                break;
+            }
+        };
+        let inner_xml = &after_open[tag_header_end + 1..close_idx];
+
+        let snippet_id = extract_xml_attr(tag_header, "snippet_id")
+            .or_else(|| extract_xml_attr(tag_header, "id"))
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        let path = extract_xml_attr(tag_header, "path")
+            .or_else(|| extract_xml_attr(tag_header, "where_path"))
+            .or_else(|| extract_xml_attr(tag_header, "where"));
+
+        let what = extract_xml_tag_content(inner_xml, "what")
+            .map(|s| decode_xml_entities(s).trim().to_string())
+            .unwrap_or_default();
+
+        let why_needed = extract_xml_tag_content(inner_xml, "why_needed")
+            .or_else(|| extract_xml_tag_content(inner_xml, "why"))
+            .or_else(|| extract_xml_tag_content(inner_xml, "needed"))
+            .map(|s| decode_xml_entities(s).trim().to_string())
+            .unwrap_or_default();
+
+        data.missing.push(RlmStructMissing {
+            snippet_id,
+            path,
+            what,
+            why_needed,
+        });
+
+        search_slice = &after_open[close_idx + close_tag.len()..];
+    }
+
+    if is_corrupt || (data.key_files.is_empty() && data.missing.is_empty() && data.summary.is_none() && data.complete.is_none()) {
+        None
+    } else {
+        Some(data)
+    }
+}
+
+fn parse_audit_missing_markdown(sections: &[(String, String)]) -> Vec<AuditGap> {
+    let mut missing: Vec<AuditGap> = Vec::new();
+    if let Some(body) = section_by(sections, "missing") {
+        for line in body.lines() {
+            let l = line.trim().trim_start_matches("- ").trim();
+            if l.is_empty() {
+                continue;
+            }
+            let mut what = l.to_string();
+            let mut why_needed = String::new();
+            if let Some(idx) = l.rfind('(') {
+                let tail = &l[idx + 1..];
+                let before = l[..idx].trim();
+                why_needed = extract_audit_needed_metadata(tail);
+                what = before.to_string();
+            }
+            let (what_clean, where_path) = split_path_and_rationale(&what);
+            let (what_final, where_final) = if where_path.is_empty() {
+                (what, String::new())
+            } else {
+                (what_clean, where_path)
+            };
+            missing.push(AuditGap {
+                what: what_final,
+                where_path: where_final,
+                why_needed,
+            });
+        }
+    }
+    missing
+}
+
 fn parse_audit_markdown(md: &str) -> Result<ContextAudit> {
     let sections = md_sections(md);
     let mut complete = false;
@@ -3389,57 +3719,50 @@ fn parse_audit_markdown(md: &str) -> Result<ContextAudit> {
         summary = body
             .lines()
             .map(|l| l.trim())
-            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("-"))
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('-'))
             .collect::<Vec<_>>()
             .join(" ")
             .trim()
             .to_string();
+    } else if let Some((heading, body)) = sections.first() {
+        let hl = heading.to_lowercase();
+        complete = hl.contains("complete") && !hl.contains("incomplete");
+        summary = body.trim().to_string();
     }
 
-    let mut missing: Vec<AuditGap> = Vec::new();
-    let missing_body = section_by(&sections, "missing")
-        .or_else(|| section_by(&sections, "kekurangan"))
-        .or_else(|| section_by(&sections, "gap"));
-
-    if let Some(body) = missing_body {
-        for line in body.lines() {
-            let l = line.trim().trim_start_matches("- ").trim_start_matches("* ").trim();
-            if l.is_empty() {
-                continue;
-            }
-            let mut what = l.to_string();
-            let mut where_path = String::new();
-            let mut why_needed = String::new();
-            if let Some(idx) = l.find('(') {
-                let tail = &l[idx + 1..];
-                let before = l[..idx].trim();
-                what = before.to_string();
-                let stripped = tail
-                    .strip_prefix("needed for:")
-                    .or_else(|| tail.strip_prefix("needed for :"));
-                if let Some(w) = stripped {
-                    why_needed = w.trim_end_matches(')').trim().to_string();
-                } else if let Some(end) = tail.find(')') {
-                    why_needed = tail[..end].trim().to_string();
-                }
-            }
-            for sep in ["—", "–", " - "] {
-                if let Some(i) = what.find(sep) {
-                    where_path = what[i + sep.len()..].trim().to_string();
-                    what = what[..i].trim().to_string();
-                    break;
-                }
-            }
-            missing.push(AuditGap {
-                what,
-                where_path,
-                why_needed,
-            });
+    // Tier 1: Try XML Structured Block first
+    let missing: Vec<AuditGap> = if let Some(struct_data) = parse_rlm_struct_xml(md) {
+        if struct_data.complete.is_some() {
+            complete = struct_data.complete.unwrap();
         }
-    }
+        if let Some(s) = struct_data.summary {
+            if !s.is_empty() {
+                summary = s;
+            }
+        }
+        if !struct_data.missing.is_empty() {
+            struct_data
+                .missing
+                .into_iter()
+                .map(|m| {
+                    let where_path = m.path.or_else(|| m.snippet_id.map(|id| format!("[snippet:{}]", id))).unwrap_or_default();
+                    AuditGap {
+                        what: m.what,
+                        where_path,
+                        why_needed: m.why_needed,
+                    }
+                })
+                .collect()
+        } else {
+            parse_audit_missing_markdown(&sections)
+        }
+    } else {
+        parse_audit_missing_markdown(&sections)
+    };
 
-    if !complete && missing.is_empty() {
-        missing.push(AuditGap {
+    let mut missing_final = missing;
+    if !complete && missing_final.is_empty() {
+        missing_final.push(AuditGap {
             what: if !summary.is_empty() {
                 summary.clone()
             } else {
@@ -3453,21 +3776,12 @@ fn parse_audit_markdown(md: &str) -> Result<ContextAudit> {
     Ok(ContextAudit {
         complete,
         summary,
-        missing,
+        missing: missing_final,
     })
 }
 
-fn parse_brief_markdown(md: &str) -> Result<ResearchBrief> {
-    let sections = md_sections(md);
-
-    let summary = section_by(&sections, "summary")
-        .map(|b| b.trim().to_string())
-        .unwrap_or_default();
-    let conventions = section_by(&sections, "conventions")
-        .map(|b| b.trim().to_string())
-        .unwrap_or_default();
-
-    let key_files: Vec<BriefFile> = section_by(&sections, "key files")
+fn parse_brief_key_files_markdown(sections: &[(String, String)]) -> Vec<BriefFile> {
+    section_by(sections, "key files")
         .map(|b| {
             b.lines()
                 .filter_map(|line| {
@@ -3475,39 +3789,17 @@ fn parse_brief_markdown(md: &str) -> Result<ResearchBrief> {
                     if l.is_empty() || l.starts_with("---") {
                         return None;
                     }
-                    let mut path = l.to_string();
-                    let mut why = String::new();
+                    let mut head = l.to_string();
                     let mut syms: Vec<String> = Vec::new();
-                    if let Some(idx) = l.find('(') {
+                    if let Some(idx) = l.rfind('(') {
                         let tail = &l[idx + 1..];
                         let before = l[..idx].trim();
-                        if let Some(s) = tail.strip_prefix("symbols:") {
-                            syms = s
-                                .trim_end_matches(')')
-                                .split(',')
-                                .map(|x| x.trim().to_string())
-                                .filter(|x| !x.is_empty())
-                                .collect();
-                        }
-                        for sep in ["—", "–", " - "] {
-                            if let Some(i) = before.find(sep) {
-                                path = before[..i].trim().to_string();
-                                why = before[i + sep.len()..].trim().to_string();
-                                break;
-                            }
-                        }
-                        if path.is_empty() {
-                            path = before.trim().to_string();
-                        }
-                    } else {
-                        for sep in ["—", "–", " - "] {
-                            if let Some(i) = l.find(sep) {
-                                path = l[..i].trim().to_string();
-                                why = l[i + sep.len()..].trim().to_string();
-                                break;
-                            }
+                        syms = extract_symbols_metadata(tail);
+                        if !syms.is_empty() {
+                            head = before.to_string();
                         }
                     }
+                    let (path, why) = split_path_and_rationale(&head);
                     if path.is_empty() {
                         None
                     } else {
@@ -3520,7 +3812,43 @@ fn parse_brief_markdown(md: &str) -> Result<ResearchBrief> {
                 })
                 .collect()
         })
+        .unwrap_or_default()
+}
+
+fn parse_brief_markdown(md: &str) -> Result<ResearchBrief> {
+    let sections = md_sections(md);
+
+    let summary = section_by(&sections, "summary")
+        .map(|b| b.trim().to_string())
         .unwrap_or_default();
+    let conventions = section_by(&sections, "conventions")
+        .map(|b| b.trim().to_string())
+        .unwrap_or_default();
+
+    // Tier 1: Try XML Structured Block first
+    let key_files: Vec<BriefFile> = if let Some(struct_data) = parse_rlm_struct_xml(md) {
+        if !struct_data.key_files.is_empty() {
+            struct_data
+                .key_files
+                .into_iter()
+                .filter_map(|kf| {
+                    let path = kf.path.or_else(|| kf.id.map(|id| format!("[snippet:{}]", id)))?;
+                    if path.is_empty() {
+                        return None;
+                    }
+                    Some(BriefFile {
+                        path,
+                        why: kf.why,
+                        key_symbols: kf.symbols,
+                    })
+                })
+                .collect()
+        } else {
+            parse_brief_key_files_markdown(&sections)
+        }
+    } else {
+        parse_brief_key_files_markdown(&sections)
+    };
 
     let relevant_snippets: Vec<BriefSnippet> = section_by(&sections, "relevant snippets")
         .map(|b| {
@@ -3578,31 +3906,18 @@ fn parse_brief_markdown(md: &str) -> Result<ResearchBrief> {
                     if l.is_empty() {
                         return None;
                     }
-                    let mut path = l.to_string();
-                    let mut why = String::new();
+                    let mut head = l.to_string();
                     let mut verified_safe = false;
-                    if let Some(idx) = l.find('(') {
+                    if let Some(idx) = l.rfind('(') {
                         let tail = &l[idx + 1..];
                         let before = l[..idx].trim();
-                        verified_safe = tail
-                            .trim_end_matches(')')
-                            .to_lowercase()
-                            .contains("yes")
-                            || tail
-                                .trim_end_matches(')')
-                                .to_lowercase()
-                                .contains("true");
-                        for sep in ["—", "–", " - "] {
-                            if let Some(i) = before.find(sep) {
-                                path = before[..i].trim().to_string();
-                                why = before[i + sep.len()..].trim().to_string();
-                                break;
-                            }
-                        }
-                        if path.is_empty() {
-                            path = before.trim().to_string();
+                        let tail_low = tail.to_lowercase();
+                        if tail_low.contains("safe:") || tail_low.contains("safe :") || tail_low.contains("yes") || tail_low.contains("true") {
+                            verified_safe = tail_low.contains("yes") || tail_low.contains("true");
+                            head = before.to_string();
                         }
                     }
+                    let (path, why) = split_path_and_rationale(&head);
                     if path.is_empty() {
                         None
                     } else {
@@ -3781,7 +4096,7 @@ fn normalize_tasks(mut tasks: Vec<SwarmPlanTask>) -> Vec<SwarmPlanTask> {
     tasks
 }
 
-fn build_executor_brief(plan: &SwarmPlan, task: &SwarmPlanTask) -> String {
+fn build_executor_brief(project_root: &Path, plan: &SwarmPlan, task: &SwarmPlanTask) -> String {
     let context_line = task
         .context
         .as_deref()
@@ -3794,17 +4109,39 @@ fn build_executor_brief(plan: &SwarmPlan, task: &SwarmPlanTask) -> String {
         .filter(|a| !a.trim().is_empty())
         .map(|a| format!("\n== ARCHITECTURE CONTRACT (your task must implement this) ==\n{}\n", a.trim()))
         .unwrap_or_default();
+
+    let target_files_section = if task.files.is_empty() {
+        "  - (discover from context)".to_string()
+    } else {
+        task.files
+            .iter()
+            .map(|f| {
+                let abs_path = if Path::new(f).is_absolute() {
+                    PathBuf::from(f)
+                } else {
+                    project_root.join(f)
+                };
+                if abs_path.exists() {
+                    format!("  - {} (EXISTS: {}) — open directly, do not search", f, abs_path.to_string_lossy())
+                } else {
+                    format!("  - {} (NEW FILE / NOT ON DISK YET — create at this exact path)", f)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     format!(
         "[EXECUTOR TASK BRIEF]\nExecute exactly this task and nothing else.\n\n\
          GOAL: {}\n\nTASK #{} (kind: {})\nDESCRIPTION: {}\n{}\
-         FILES EXPECTED: {}\nACCEPTANCE: {}\n{}\n\n\
+         TARGET FILES (EXACT PATHS — DO NOT SEARCH IF VERIFIED):\n{}\n\nACCEPTANCE: {}\n{}\n\n\
          FULL PLAN (context only, do not execute other tasks):\n{}",
         plan.goal,
         task.id,
         task.kind,
         task.description,
         context_line,
-        if task.files.is_empty() { "(discover from context)".to_string() } else { task.files.join(", ") },
+        target_files_section,
         task.acceptance,
         architecture_line,
         render_plan_markdown(plan)
@@ -4220,6 +4557,11 @@ Build an axum web app
 
     #[test]
     fn test_build_executor_brief_renders_markdown_not_json() {
+        let temp_dir = std::env::temp_dir().join("kuda_brief_test");
+        let project_root = temp_dir.join("project");
+        let _ = std::fs::create_dir_all(project_root.join("src"));
+        let _ = std::fs::write(project_root.join("src/main.rs"), "fn main() {}");
+
         let plan = SwarmPlan {
             goal: "Build a booking web app".into(),
             architecture: Some("Data flow: request -> handler -> store -> response".into()),
@@ -4229,16 +4571,20 @@ Build an axum web app
                 kind: "code".into(),
                 description: "Add the endpoint\n  1. edit src/main.rs".into(),
                 context: Some("do not touch auth".into()),
-                files: vec!["src/main.rs".into()],
+                files: vec!["src/main.rs".into(), "src/new_mod.rs".into()],
                 acceptance: "cargo check passes".into(),
             }],
         };
-        let brief = build_executor_brief(&plan, &plan.tasks[0]);
+        let brief = build_executor_brief(&project_root, &plan, &plan.tasks[0]);
         assert!(brief.contains("ARCHITECTURE CONTRACT"), "{}", brief);
         assert!(brief.contains("## Task 1 [code]"));
         assert!(brief.contains("do not touch auth"));
         assert!(brief.contains("1. edit src/main.rs"));
+        assert!(brief.contains("src/main.rs (EXISTS:"), "must mark existing file as EXISTS");
+        assert!(brief.contains("src/new_mod.rs (NEW FILE"), "must mark missing file as NEW FILE");
         assert!(!brief.contains("{\""), "brief must not be raw JSON");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
@@ -4321,13 +4667,13 @@ snake_case, rusqlite with Arc<Mutex>
         let project_root = temp_dir.join("project");
         let _ = std::fs::create_dir_all(&project_root);
 
-        let args = r#"{"file_path": ".kuda/plan.md"}"#;
+        let args = r#"{"file_path": ".kuda/plan/plan.md"}"#;
         let fallback = "# Goal\nplan from response text";
         let doc = handoff_doc(&project_root, args, fallback).unwrap();
         assert_eq!(doc, fallback);
 
         // The document must be persisted as a project artifact.
-        let persisted = project_root.join(".kuda/plan.md");
+        let persisted = project_root.join(".kuda/plan/plan.md");
         assert!(persisted.exists());
         assert_eq!(std::fs::read_to_string(&persisted).unwrap(), fallback);
 
@@ -4691,5 +5037,101 @@ snake_case, rusqlite with Arc<Mutex>
         clear_checkpoint(&temp_dir, run_id);
         assert!(load_checkpoint(&temp_dir, run_id).is_none());
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_parse_rlm_struct_xml_and_dual_channel_brief() {
+        let md = r#"# Summary
+Web app with auth and retry mechanisms.
+
+# Key Files
+- src/old_parser.rs — old fallback parser
+
+# Machine Index
+---RLM_STRUCT_DATA_START---
+<rlm_struct version="1">
+  <key_file id="3">
+    <why>JWT authentication entry &amp; token validator</why>
+    <symbols>login:12, verify_token:45</symbols>
+  </key_file>
+  <key_file path="src/config.rs">
+    <why>App configuration "structures" &lt;global&gt;</why>
+    <symbols>Config:10, load:20</symbols>
+  </key_file>
+</rlm_struct>
+---RLM_STRUCT_DATA_END---
+
+# Relevant Snippets
+--- src/auth.rs [1-20]
+pub fn login() {}
+"#;
+        let brief = parse_brief_markdown(md).unwrap();
+        assert!(brief.summary.contains("Web app with auth"));
+        // Tier 1 XML-first should win over free-text markdown key files
+        assert_eq!(brief.key_files.len(), 2);
+        assert_eq!(brief.key_files[0].path, "[snippet:3]");
+        assert_eq!(brief.key_files[0].why, "JWT authentication entry & token validator");
+        assert_eq!(brief.key_files[0].key_symbols, vec!["login:12", "verify_token:45"]);
+        assert_eq!(brief.key_files[1].path, "src/config.rs");
+        assert_eq!(brief.key_files[1].why, "App configuration \"structures\" <global>");
+        assert_eq!(brief.key_files[1].key_symbols, vec!["Config:10", "load:20"]);
+    }
+
+    #[test]
+    fn test_parse_rlm_struct_xml_and_dual_channel_audit() {
+        let md = r#"# Audit: INCOMPLETE
+Needs more retry logic facts.
+
+# Machine Index
+---RLM_STRUCT_DATA_START---
+<rlm_struct version="1">
+  <summary>Verifier detected missing retry logic</summary>
+  <complete>false</complete>
+  <missing snippet_id="7">
+    <what>Backoff retry loop</what>
+    <why_needed>Executor timeout handling &amp; resilience</why_needed>
+  </missing>
+  <missing path="src/client.rs">
+    <what>HTTP timeout configuration</what>
+    <why_needed>Prevent infinite blocking</why_needed>
+  </missing>
+</rlm_struct>
+---RLM_STRUCT_DATA_END---
+"#;
+        let audit = parse_audit_markdown(md).unwrap();
+        assert!(!audit.complete);
+        assert_eq!(audit.summary, "Verifier detected missing retry logic");
+        assert_eq!(audit.missing.len(), 2);
+        assert_eq!(audit.missing[0].where_path, "[snippet:7]");
+        assert_eq!(audit.missing[0].what, "Backoff retry loop");
+        assert_eq!(audit.missing[0].why_needed, "Executor timeout handling & resilience");
+        assert_eq!(audit.missing[1].where_path, "src/client.rs");
+        assert_eq!(audit.missing[1].what, "HTTP timeout configuration");
+    }
+
+    #[test]
+    fn test_parse_rlm_struct_xml_corrupt_falls_back_cleanly() {
+        // Truncated XML mid-tag (missing close tag) must be marked corrupt and fall back to Tier 2 Markdown
+        let md = r#"# Summary
+Web app with auth.
+
+# Key Files
+- src/auth.rs — auth handler (symbols: login:12)
+- src/db.rs — database layer
+
+# Machine Index
+---RLM_STRUCT_DATA_START---
+<rlm_struct version="1">
+  <key_file id="3" path="src/auth.rs">
+    <why>JWT auth
+  <!-- UNCLOSED TAG DUE TO TRUNCATION -->
+---RLM_STRUCT_DATA_END---
+"#;
+        let brief = parse_brief_markdown(md).unwrap();
+        assert_eq!(brief.key_files.len(), 2, "must fall back to markdown key files without losing entries");
+        assert_eq!(brief.key_files[0].path, "src/auth.rs");
+        assert_eq!(brief.key_files[0].why, "auth handler");
+        assert_eq!(brief.key_files[0].key_symbols, vec!["login:12"]);
+        assert_eq!(brief.key_files[1].path, "src/db.rs");
     }
 }

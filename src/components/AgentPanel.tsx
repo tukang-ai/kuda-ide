@@ -58,6 +58,7 @@ const ROLE_META: Record<string, { name: string; color: string }> = {
   thinker: { name: 'Thinker', color: '#a78bfa' },
   reviewer: { name: 'Reviewer', color: '#38bdf8' },
   planning_writer: { name: 'Planning Writer', color: '#2dd4bf' },
+  plan_reviewer: { name: 'Plan Reviewer', color: '#c084fc' },
   executor_code: { name: 'Executor Code', color: '#fbbf24' },
   executor_design: { name: 'Executor Design', color: '#f472b6' },
   executor_reviewer: { name: 'Executor Reviewer', color: '#34d399' },
@@ -426,8 +427,9 @@ export const PlanDecisionGateCard: React.FC<{
           className="primary-btn"
           style={{ padding: '5px 12px', fontSize: 11, justifyContent: 'center' }}
           onClick={() => onDecide('execute')}
+          title="Langsung mulai eksekusi kode — lewati Reviewer utama untuk hemat token"
         >
-          <Check size={12} /> Eksekusi
+          <Check size={12} /> Eksekusi Langsung (Executor Code)
         </button>
         {canModify && (
           <>
@@ -436,16 +438,17 @@ export const PlanDecisionGateCard: React.FC<{
               style={{ padding: '5px 10px', fontSize: 11, border: '1px solid var(--border-subtle)' }}
               disabled={!note.trim()}
               onClick={() => onDecide('revise', note.trim())}
-              title="Kirim instruksi ini ke Thinker untuk memperbaiki plan"
+              title="Kirim instruksi ini ke Thinker/Planning Writer untuk memperbaiki plan"
             >
-              <PencilLine size={12} /> Minta Thinker perbaiki plan
+              <PencilLine size={12} /> Minta revisi plan
             </button>
             <button
               className="icon-btn"
               style={{ padding: '5px 10px', fontSize: 11, border: '1px solid var(--border-subtle)' }}
               onClick={() => onDecide('review')}
+              title="Jalankan Reviewer utama (model pintar) untuk mengaudit & memperdalam plan"
             >
-              <SearchCheck size={12} /> Minta Reviewer
+              <SearchCheck size={12} /> Audit Reviewer Utama
             </button>
           </>
         )}

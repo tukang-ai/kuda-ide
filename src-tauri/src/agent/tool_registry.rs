@@ -1113,9 +1113,9 @@ impl Tool for WriteFileTool {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        // Fallback: If path is omitted/empty but content is clearly a plan document, assume .kuda/plan.md
+        // Fallback: If path is omitted/empty but content is clearly a plan document, assume .kuda/plan/plan.md
         if path_str.trim().is_empty() && (content.contains("# Goal") || content.contains("## Architecture") || content.contains("## Task 1")) {
-            path_str = ".kuda/plan.md";
+            path_str = ".kuda/plan/plan.md";
         }
 
         if path_str.trim().is_empty() {
@@ -1165,7 +1165,7 @@ impl Tool for WriteFileTool {
     }
 }
 
-// 7. Submit Plan Tool (handoff: Thinker/Reviewer -> Orchestrator)
+// 7. Submit Plan Tool (handoff: PlanningWriter -> Orchestrator)
 // The model writes the COMPLETE plan to the project file via write_file, then
 // calls this tool with only a tiny file path — never the plan body, which is
 // far too large to fit in tool-call arguments (that caused JSON truncation)
@@ -1177,13 +1177,13 @@ impl Tool for SubmitPlanTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "submit_plan".to_string(),
-            description: "Submits the final execution plan. FIRST write the COMPLETE plan markdown to the project file (e.g. \".kuda/plan.md\") using write_file, THEN call this tool exactly once with that project-relative file path. Do NOT put the plan body in this call's arguments, and do NOT paste the plan in your response text — write a short conclusion instead.".to_string(),
+            description: "Submits the final execution plan. FIRST write the COMPLETE plan markdown to the project file (e.g. \".kuda/plan/plan.md\") using write_file, THEN call this tool exactly once with that project-relative file path. Do NOT put the plan body in this call's arguments, and do NOT paste the plan in your response text — write a short conclusion instead.".to_string(),
             parameters_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Project-relative path where the plan markdown is stored (e.g. \".kuda/plan.md\")"
+                        "description": "Project-relative path where the plan markdown is stored (e.g. \".kuda/plan/plan.md\")"
                     }
                 },
                 "required": ["file_path"]

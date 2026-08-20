@@ -6,7 +6,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -112,21 +112,21 @@ _RLM_ENV_ALLOW = frozenset({
 # allowlist would keep rejecting (or accepting) paths after a sync/reset. The
 # mutation helpers (`_safe_open`, `_safe_chdir`, ...) are redefined fresh each
 # install, so only these module-level originals are needed.
-_orig_open = builtins.open
-_orig_os_open = os.open
-_orig_fdopen = os.fdopen
-_orig_chdir = os.chdir
-_orig_scandir = os.scandir
-_orig_walk = os.walk
-_orig_listdir = os.listdir
-_orig_path_open = pathlib.Path.open
-_orig_realpath = os.path.realpath
-_orig_stat = os.stat
-_orig_import = builtins.__import__
-_orig_path_probes = {}
-for _pn in ('exists', 'isfile', 'isdir', 'lexists', 'islink', 'getsize', 'getatime', 'getmtime', 'getctime'):
-    if hasattr(os.path, _pn):
-        _orig_path_probes[_pn] = getattr(os.path, _pn)
+_RLM_GUARD_INTERNALS = {
+    'open': builtins.open,
+    'os_open': os.open,
+    'fdopen': os.fdopen,
+    'chdir': os.chdir,
+    'scandir': os.scandir,
+    'walk': os.walk,
+    'listdir': os.listdir,
+    'path_open': pathlib.Path.open,
+    'realpath': os.path.realpath,
+    'stat': os.stat,
+    'import': builtins.__import__,
+    'sys': _sys,
+    'path_probes': {pn: getattr(os.path, pn) for pn in ('exists', 'isfile', 'isdir', 'lexists', 'islink', 'getsize', 'getatime', 'getmtime', 'getctime') if hasattr(os.path, pn)},
+}
 
 def _rlm_install_guard():
     # Closure-capture the CURRENT allowlist + root at install time. The guard
@@ -147,17 +147,18 @@ def _rlm_install_guard():
     # the REAL functions — never a previously-installed wrapper — and the safe
     # wrappers close over these locals, which lets `execute_user_code` rebuild
     # them against a private globals dict without losing access.
-    _orig_open = globals()['_orig_open']
-    _orig_os_open = globals()['_orig_os_open']
-    _orig_fdopen = globals()['_orig_fdopen']
-    _orig_chdir = globals()['_orig_chdir']
-    _orig_scandir = globals()['_orig_scandir']
-    _orig_walk = globals()['_orig_walk']
-    _orig_listdir = globals()['_orig_listdir']
-    _orig_path_open = globals()['_orig_path_open']
-    _orig_realpath = globals()['_orig_realpath']
-    _orig_stat = globals()['_orig_stat']
-    _orig_import = globals()['_orig_import']
+    _orig_open = _RLM_GUARD_INTERNALS['open']
+    _orig_os_open = _RLM_GUARD_INTERNALS['os_open']
+    _orig_fdopen = _RLM_GUARD_INTERNALS['fdopen']
+    _orig_chdir = _RLM_GUARD_INTERNALS['chdir']
+    _orig_scandir = _RLM_GUARD_INTERNALS['scandir']
+    _orig_walk = _RLM_GUARD_INTERNALS['walk']
+    _orig_listdir = _RLM_GUARD_INTERNALS['listdir']
+    _orig_path_open = _RLM_GUARD_INTERNALS['path_open']
+    _orig_realpath = _RLM_GUARD_INTERNALS['realpath']
+    _orig_stat = _RLM_GUARD_INTERNALS['stat']
+    _orig_import = _RLM_GUARD_INTERNALS['import']
+    _orig_path_probes = _RLM_GUARD_INTERNALS['path_probes']
     # The `_orig_*` originals are module-level (captured once, see above); only
     # the environment snapshot is taken per-install (it is re-sanitized from the
     # previous sanitized copy, so it stays clean).
@@ -167,6 +168,7 @@ def _rlm_install_guard():
     # plain list (from the bootstrap snippet) into the immutable container once.
     if not isinstance(_rlm_allowlist, _rlm_Allowlist):
         _rlm_allowlist = _rlm_Allowlist(_rlm_allowlist)
+    globals()['_rlm_allowlist'] = _rlm_allowlist
 
     _rlm_denylist = (
         os.path.expanduser('~/.ssh'),
@@ -437,11 +439,11 @@ def _rlm_install_guard():
                           'posix', '_posixsubprocess'}
     def _safe_import(name, *args, **kwargs):
         top = name.split('.')[0]
-        # `builtins` hands out every patched function whose closure leaks the
-        # saved originals — refuse it entirely. Everything else in the protected
-        # set is routed back to the (patched) module already in sys.modules.
+        # `builtins` and `sys` hand out unpatched globals and originals — refuse them entirely.
         if top == 'builtins':
             raise ImportError("import of 'builtins' is restricted in the RLM kernel")
+        if top == 'sys':
+            raise ImportError("import of 'sys' is restricted in the RLM kernel")
         if top in _protected_imports:
             mod = _sys.modules.get(top)
             if mod is None:
@@ -477,9 +479,9 @@ def _rlm_install_guard():
 /// Memoization helper: `_rlm_load(path)` reads a file with mtime+size+sha256
 /// invalidation, caching content in `_rlm_index` so unchanged files are not
 /// re-read across RLM Model calls. Scope is enforced via the guarded `open`.
-/// Fast path trusts `(mtime, size)`; any mismatch re-reads and falls back to a
-/// sha256 comparison so timestamp-preserving writes (`cp -p`, `rsync --times`)
-/// never serve stale content.
+/// Fast path trusts the 5-tuple `(ino, dev, size, mtime_ns, ctime_ns)`; any mismatch re-reads
+/// and falls back to a sha256 comparison so timestamp-preserving writes (`cp -p`, `rsync --times`, `touch -r`)
+/// or sub-second mutations never serve stale content.
 const MEMO_PY: &str = r#"
 import hashlib, time
 _rlm_index = {}
@@ -491,19 +493,43 @@ def _rlm_load(path):
         raise ReadOnlyError("RLM Kernel SECURITY: _rlm_load denied path: '%s'" % path)
     key = os.path.realpath(path)
     st = os.stat(path)
+    mtime_ns = getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9))
+    ctime_ns = getattr(st, 'st_ctime_ns', int(getattr(st, 'st_ctime', st.st_mtime) * 1e9))
+    ino = getattr(st, 'st_ino', 0)
+    dev = getattr(st, 'st_dev', 0)
+    size = st.st_size
+
     entry = _rlm_index.get(key)
-    if entry is not None and entry['mtime'] == st.st_mtime and entry['size'] == st.st_size:
+    if (entry is not None and
+        entry.get('ino') == ino and
+        entry.get('dev') == dev and
+        entry.get('size') == size and
+        entry.get('mtime_ns') == mtime_ns and
+        entry.get('ctime_ns') == ctime_ns):
         return entry['content']
-    with open(path, 'r') as f:
+
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
         content = f.read()
     sha = hashlib.sha256(content.encode('utf-8', errors='replace')).hexdigest()
-    if entry is not None and entry['sha'] == sha:
-        # Content unchanged but mtime/size drifted (cp -p / touch -r): refresh
-        # metadata and serve the cached content instead of re-processing it.
-        entry['mtime'] = st.st_mtime
-        entry['size'] = st.st_size
+    if entry is not None and entry.get('sha') == sha:
+        # Content unchanged but metadata drifted: refresh metadata and serve cached content
+        entry['mtime_ns'] = mtime_ns
+        entry['ctime_ns'] = ctime_ns
+        entry['ino'] = ino
+        entry['dev'] = dev
+        entry['size'] = size
         return entry['content']
-    _rlm_index[key] = {'mtime': st.st_mtime, 'size': st.st_size, 'sha': sha, 'content': content, 'loaded_at': time.time()}
+
+    _rlm_index[key] = {
+        'ino': ino,
+        'dev': dev,
+        'size': size,
+        'mtime_ns': mtime_ns,
+        'ctime_ns': ctime_ns,
+        'sha': sha,
+        'content': content,
+        'loaded_at': time.time(),
+    }
     return content
 
 def _rlm_forget(path=None):
@@ -767,7 +793,7 @@ pub struct RlmKernelProcess {
     pub child: Child,
     pub stdin: ChildStdin,
     pub stdout_reader: tokio::io::Lines<BufReader<ChildStdout>>,
-    pub stderr_lines: Arc<Mutex<Vec<String>>>,
+    pub stderr_reader: tokio::io::Lines<BufReader<ChildStderr>>,
     pub project_root: PathBuf,
 }
 
@@ -801,22 +827,14 @@ impl RlmKernelProcess {
             .take()
             .ok_or_else(|| AppError::General("Failed to capture Python stderr pipe".to_string()))?;
 
-        let stderr_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let stderr_capture = stderr_lines.clone();
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                stderr_capture.lock().await.push(line);
-            }
-        });
-
         let stdout_reader = BufReader::new(stdout).lines();
+        let stderr_reader = BufReader::new(stderr).lines();
 
         let mut proc = Self {
             child,
             stdin,
             stdout_reader,
-            stderr_lines,
+            stderr_reader,
             project_root: project_root.to_path_buf(),
         };
 
@@ -841,12 +859,19 @@ impl RlmKernelProcess {
     }
 
     pub async fn execute_code(&mut self, code: &str, timeout_secs: u64) -> Result<String> {
-        let (file_path, path_b64, sentinel) = self.stage_code(code)?;
+        let (file_path, path_b64, uuid) = self.stage_code(code)?;
+        let stdout_sentinel = format!("---RLM_STDOUT_{}---", uuid);
+        let stderr_sentinel = format!("---RLM_STDERR_{}---", uuid);
         let py_cmd = format!(
-            "import base64 as _rlm_b64\n_rlm_p = _rlm_b64.b64decode(b'{}').decode()\nexec(open(_rlm_p).read(), globals())\nprint(\"{}\")\n",
-            path_b64, sentinel
+            "import base64 as _rlm_b64\n\
+             _rlm_p = _rlm_b64.b64decode(b'{}').decode()\n\
+             exec(open(_rlm_p).read(), globals())\n\
+             (_RLM_GUARD_INTERNALS['sys'] if '_RLM_GUARD_INTERNALS' in globals() else __import__('sys')).stderr.write(\"{}\\n\")\n\
+             (_RLM_GUARD_INTERNALS['sys'] if '_RLM_GUARD_INTERNALS' in globals() else __import__('sys')).stderr.flush()\n\
+             print(\"{}\")\n",
+            path_b64, stderr_sentinel, stdout_sentinel
         );
-        self.exec_staged(&py_cmd, &sentinel, &file_path, timeout_secs).await
+        self.exec_staged(&py_cmd, &stdout_sentinel, &stderr_sentinel, &file_path, timeout_secs).await
     }
 
     /// Executes MODEL-supplied code in a RESTRICTED namespace. Only the public
@@ -874,7 +899,9 @@ impl RlmKernelProcess {
     /// read the allowlist/root from their closure (see `_rlm_install_guard`), so
     /// even a leaked reference cannot rebind what the checks consult.
     pub async fn execute_user_code(&mut self, code: &str, timeout_secs: u64) -> Result<String> {
-        let (file_path, path_b64, sentinel) = self.stage_code(code)?;
+        let (file_path, path_b64, uuid) = self.stage_code(code)?;
+        let stdout_sentinel = format!("---RLM_STDOUT_{}---", uuid);
+        let stderr_sentinel = format!("---RLM_STDERR_{}---", uuid);
         let user_names = RLM_USER_NAMESPACE_NAMES
             .iter()
             .map(|n| format!("'{}'", n))
@@ -920,15 +947,43 @@ impl RlmKernelProcess {
              _rlm_user = {{n: _rlm_ty.FunctionType(globals()[n].__code__, _rlm_priv, n, globals()[n].__defaults__, globals()[n].__closure__) for n in [{}]}}\n\
              _rlm_user['__builtins__'] = _rlm_bs\n\
              _rlm_priv.update(_rlm_user)\n\
-             exec(open(_rlm_p).read(), _rlm_user)\nprint(\"{}\")\n",
-            path_b64, private_names, user_names, sentinel
+             exec(open(_rlm_p).read(), _rlm_user)\n\
+             (_RLM_GUARD_INTERNALS['sys'] if '_RLM_GUARD_INTERNALS' in globals() else __import__('sys')).stderr.write(\"{}\\n\")\n\
+             (_RLM_GUARD_INTERNALS['sys'] if '_RLM_GUARD_INTERNALS' in globals() else __import__('sys')).stderr.flush()\n\
+             print(\"{}\")\n",
+            path_b64, private_names, user_names, stderr_sentinel, stdout_sentinel
         );
-        self.exec_staged(&py_cmd, &sentinel, &file_path, timeout_secs).await
+        self.exec_staged(&py_cmd, &stdout_sentinel, &stderr_sentinel, &file_path, timeout_secs).await
+    }
+
+    /// Atomically extracts the entire Python `_rlm_bank` using base64-enveloped magic framing,
+    /// completely immune to stdout noise, escaping corruptions, or multiline outputs.
+    pub async fn dump_snippet_bank(&mut self) -> Result<std::collections::HashMap<String, serde_json::Value>> {
+        let code = "import json as _rj, base64 as _rb64\n\
+                    _b64_d = _rb64.b64encode(_rj.dumps({str(_k): {'rel': _v['rel'], 'start': _v['start'], 'end': _v['end'], 'content': _v['content']} for _k, _v in _rlm_bank.items()}).encode()).decode()\n\
+                    print('---RLM_BANK_DATA_START---' + _b64_d + '---RLM_BANK_DATA_END---')\n";
+        let out = self.execute_code(code, 10).await?;
+        let start_tag = "---RLM_BANK_DATA_START---";
+        let end_tag = "---RLM_BANK_DATA_END---";
+        let start_idx = out.find(start_tag).ok_or_else(|| {
+            AppError::General("RLM snippet bank start marker not found in output".to_string())
+        })?;
+        let after_start = &out[start_idx + start_tag.len()..];
+        let end_idx = after_start.find(end_tag).ok_or_else(|| {
+            AppError::General("RLM snippet bank end marker not found in output".to_string())
+        })?;
+        let b64_str = after_start[..end_idx].trim();
+        let json_bytes = BASE64.decode(b64_str).map_err(|e| {
+            AppError::General(format!("Failed to base64 decode snippet bank: {}", e))
+        })?;
+        let bank = serde_json::from_slice(&json_bytes).map_err(|e| {
+            AppError::General(format!("Failed to parse snippet bank JSON: {}", e))
+        })?;
+        Ok(bank)
     }
 
     fn stage_code(&self, code: &str) -> Result<(PathBuf, String, String)> {
         let uuid = Uuid::new_v4().to_string();
-        let sentinel = format!("---RLM_SENTINEL_{}---", uuid);
 
         // Stage the code in a scratch file and exec it via a SHORT stdin command.
         // Python's interactive line reader truncates long single-line commands
@@ -944,19 +999,17 @@ impl RlmKernelProcess {
             }
         };
         let path_b64 = BASE64.encode(file_path.to_string_lossy().as_bytes());
-        Ok((file_path, path_b64, sentinel))
+        Ok((file_path, path_b64, uuid))
     }
 
     async fn exec_staged(
         &mut self,
         py_cmd: &str,
-        sentinel: &str,
+        stdout_sentinel: &str,
+        stderr_sentinel: &str,
         file_path: &std::path::Path,
         timeout_secs: u64,
     ) -> Result<String> {
-        // Drop stderr leftovers from a previous run before opening this window.
-        self.stderr_lines.lock().await.clear();
-
         self.stdin
             .write_all(py_cmd.as_bytes())
             .await
@@ -967,12 +1020,17 @@ impl RlmKernelProcess {
             .map_err(|e| AppError::General(format!("Failed to flush Python stdin: {}", e)))?;
 
         let mut output_lines: Vec<String> = Vec::new();
-        let mut found_sentinel = false;
+        let mut stderr_lines: Vec<String> = Vec::new();
+        let mut found_stdout = false;
+        let mut found_stderr = false;
 
-        let read_future = async {
-            while let Ok(Some(line)) = self.stdout_reader.next_line().await {
-                if line.contains(&sentinel) {
-                    found_sentinel = true;
+        let stdout_reader = &mut self.stdout_reader;
+        let stderr_reader = &mut self.stderr_reader;
+
+        let read_stdout = async {
+            while let Ok(Some(line)) = stdout_reader.next_line().await {
+                if line.contains(stdout_sentinel) {
+                    found_stdout = true;
                     break;
                 }
                 // `python -i` echoes `>>> ` / `... ` prompts to stdout between
@@ -990,18 +1048,37 @@ impl RlmKernelProcess {
             }
         };
 
+        let read_stderr = async {
+            while let Ok(Some(line)) = stderr_reader.next_line().await {
+                if line.contains(stderr_sentinel) {
+                    found_stderr = true;
+                    break;
+                }
+                let mut cleaned: &str = line.trim_start();
+                while cleaned.starts_with(">>> ") || cleaned.starts_with("... ") {
+                    cleaned = cleaned[4..].trim_start();
+                }
+                if cleaned.trim().is_empty() {
+                    continue;
+                }
+                stderr_lines.push(cleaned.to_string());
+            }
+        };
+
         let result = match tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
-            read_future,
+            async {
+                tokio::join!(read_stdout, read_stderr);
+            },
         )
         .await
         {
             Ok(_) => {
-                if found_sentinel {
+                if found_stdout && found_stderr {
                     Ok(())
                 } else {
                     Err(AppError::General(
-                        "Python process terminated unexpectedly before sentinel was received.".to_string(),
+                        "Python process terminated unexpectedly before both sentinels were received.".to_string(),
                     ))
                 }
             }
@@ -1021,17 +1098,13 @@ impl RlmKernelProcess {
         let _ = std::fs::remove_file(file_path);
         result?;
 
-        // Grace window so stderr tracebacks flushed before the sentinel are captured.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let stderr_buf = std::mem::take(&mut *self.stderr_lines.lock().await);
-
         let mut output = output_lines.join("\n");
-        if !stderr_buf.is_empty() {
+        if !stderr_lines.is_empty() {
             if !output.is_empty() {
                 output.push('\n');
             }
             output.push_str("=== STDERR ===\n");
-            output.push_str(&stderr_buf.join("\n"));
+            output.push_str(&stderr_lines.join("\n"));
         }
         Ok(output)
     }

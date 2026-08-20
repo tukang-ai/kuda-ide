@@ -280,6 +280,7 @@ export interface AgentConfig {
   thinker: ModelRef;
   reviewers: ModelRef[];
   planning_writer: ModelRef;
+  plan_reviewer?: ModelRef;
   executor_code: ModelRef;
   executor_design: ModelRef;
   executor_reviewer: ModelRef;

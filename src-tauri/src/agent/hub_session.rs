@@ -14,10 +14,10 @@ const MASTER_KEY: &str = "kuda_hub_master";
 /// Keychain entry holding the RFC3339 expiry of the current session key.
 const SESSION_EXPIRY_KEY: &str = "kuda_hub_session_expiry";
 const SESSION_KEY_PREFIX: &str = "kuda_sk_";
-/// Refresh at most this long before the session key expires. 10 minutes so a
+/// Refresh at most this long before the session key expires. 30 minutes so a
 /// mid-run refresh (before each phase resolves its provider) still leaves a wide
 /// safety window for long swarms paused at a gate.
-const REFRESH_AHEAD: chrono::Duration = chrono::Duration::minutes(10);
+const REFRESH_AHEAD: chrono::Duration = chrono::Duration::minutes(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HubSessionInfo {

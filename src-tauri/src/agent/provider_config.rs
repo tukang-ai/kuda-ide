@@ -47,6 +47,10 @@ pub struct AgentConfig {
     /// loop runs in a PRIVATE context that never enters the shared swarm history.
     #[serde(default)]
     pub planning_writer: ModelRef,
+    /// Plan Reviewer: reviews the draft plan and evaluates reviewer directions.
+    /// Can be configured separately (cheap/medium/smart) to save Thinker tokens.
+    #[serde(default)]
+    pub plan_reviewer: ModelRef,
     #[serde(default)]
     pub executor_code: ModelRef,
     #[serde(default)]
@@ -74,6 +78,7 @@ impl Default for AgentConfig {
             thinker: ModelRef::default(),
             reviewers: vec![ModelRef::default()],
             planning_writer: ModelRef::default(),
+            plan_reviewer: ModelRef::default(),
             executor_code: ModelRef::default(),
             executor_design: ModelRef::default(),
             executor_reviewer: ModelRef::default(),
@@ -102,6 +107,8 @@ impl Default for ProviderConfig {
             "reviewer_cheap".to_string(),
             "planning_writer".to_string(),
             "planning_writer_plus".to_string(),
+            "plan_reviewer".to_string(),
+            "plan_reviewer_plus".to_string(),
             "executor_code".to_string(),
             "executor_code_plus".to_string(),
             "executor_design".to_string(),
@@ -125,6 +132,7 @@ impl Default for ProviderConfig {
                 thinker: bind("thinker"),
                 reviewers: vec![bind("reviewer")],
                 planning_writer: bind("planning_writer"),
+                plan_reviewer: bind("plan_reviewer"),
                 executor_code: bind("executor_code"),
                 executor_design: bind("executor_design"),
                 executor_reviewer: bind("executor_reviewer"),
@@ -160,6 +168,12 @@ impl ProviderConfigManager {
             {
                 p.base_url = HUB_BASE_URL.to_string();
             }
+        }
+        if cfg.agent.plan_reviewer.provider_id.is_empty() {
+            cfg.agent.plan_reviewer = ModelRef {
+                provider_id: "kuda_hub".to_string(),
+                model: "plan_reviewer".to_string(),
+            };
         }
         Ok(cfg)
     }

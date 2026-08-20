@@ -15,6 +15,7 @@ pub struct OpenAiProvider {
     pub base_url: String,
     pub api_key: String,
     pub model_name: String,
+    pub key_resolver: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 impl OpenAiProvider {
@@ -25,7 +26,21 @@ impl OpenAiProvider {
             api_key,
             base_url: trimmed_base,
             model_name: model_name.unwrap_or_else(|| "gpt-4o".to_string()),
+            key_resolver: None,
         }
+    }
+
+    pub fn with_key_resolver(mut self, resolver: Arc<dyn Fn() -> Option<String> + Send + Sync>) -> Self {
+        self.key_resolver = Some(resolver);
+        self
+    }
+
+    pub fn effective_api_key(&self) -> String {
+        self.key_resolver
+            .as_ref()
+            .and_then(|f| f())
+            .filter(|k| !k.is_empty())
+            .unwrap_or_else(|| self.api_key.clone())
     }
 }
 
@@ -65,8 +80,9 @@ impl LlmProvider for OpenAiProvider {
             .header("Connection", "keep-alive")
             .header("Accept", "text/event-stream");
 
-        if !self.api_key.is_empty() {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", self.api_key));
+        let effective_key = self.effective_api_key();
+        if !effective_key.is_empty() {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", effective_key));
         }
 
         let body = build_openai_body(&request, &self.model_name);

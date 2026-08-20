@@ -13,6 +13,7 @@ pub enum AgentRole {
     Thinker,
     Reviewer,
     PlanningWriter,
+    PlanReviewer,
     ExecutorCode,
     ExecutorDesign,
     ExecutorReviewer,
@@ -26,6 +27,7 @@ impl AgentRole {
             AgentRole::Thinker => "thinker",
             AgentRole::Reviewer => "reviewer",
             AgentRole::PlanningWriter => "planning_writer",
+            AgentRole::PlanReviewer => "plan_reviewer",
             AgentRole::ExecutorCode => "executor_code",
             AgentRole::ExecutorDesign => "executor_design",
             AgentRole::ExecutorReviewer => "executor_reviewer",
@@ -39,6 +41,7 @@ impl AgentRole {
             AgentRole::Thinker => "Thinker",
             AgentRole::Reviewer => "Reviewer",
             AgentRole::PlanningWriter => "Planning Writer",
+            AgentRole::PlanReviewer => "Plan Reviewer",
             AgentRole::ExecutorCode => "Executor Code",
             AgentRole::ExecutorDesign => "Executor Design",
             AgentRole::ExecutorReviewer => "Executor Reviewer",
@@ -55,6 +58,13 @@ impl AgentRole {
                 temperature: 0.2,
                 allowed_tools: vec![
                     "request_rlm_research".into(),
+                ],
+            },
+            AgentRole::PlanReviewer => RoleSpec {
+                role: *self,
+                max_turns: 2,
+                temperature: 0.1,
+                allowed_tools: vec![
                     "submit_plan_review".into(),
                 ],
             },
@@ -205,6 +215,7 @@ fn role_model_refs(role: AgentRole, cfg: &crate::agent::provider_config::AgentCo
     match role {
         AgentRole::Thinker => vec![cfg.thinker.clone()],
         AgentRole::PlanningWriter => vec![cfg.planning_writer.clone()],
+        AgentRole::PlanReviewer => vec![cfg.plan_reviewer.clone()],
         AgentRole::Reviewer => {
             let mut refs = cfg.reviewers.clone();
             if refs.is_empty() {
@@ -259,11 +270,20 @@ fn build_provider(app_data_dir: &Path, model_ref: &ModelRef) -> Result<Arc<dyn L
     } else {
         Some(model_ref.model.clone())
     };
-    Ok(wrap_gateway(Arc::new(OpenAiProvider::new(
+    let mut openai = OpenAiProvider::new(
         api_key,
         Some(base_url),
         model,
-    ))))
+    );
+    if model_ref.provider_id == "kuda_hub" {
+        let app_dir_buf = app_data_dir.to_path_buf();
+        openai = openai.with_key_resolver(Arc::new(move || {
+            crate::agent::hub_session::HubCredentialStore::load(&app_dir_buf)
+                .map(|c| c.session_key)
+                .filter(|k| !k.is_empty())
+        }));
+    }
+    Ok(wrap_gateway(Arc::new(openai)))
 }
 
 /// Resolves an LLM provider for a specific agent role.
@@ -392,6 +412,7 @@ mod tests {
             AgentRole::Thinker,
             AgentRole::Reviewer,
             AgentRole::PlanningWriter,
+            AgentRole::PlanReviewer,
             AgentRole::ExecutorCode,
             AgentRole::ExecutorDesign,
             AgentRole::ExecutorReviewer,
@@ -401,7 +422,7 @@ mod tests {
         let mut keys: Vec<&str> = roles.iter().map(|r| r.key()).collect();
         keys.sort();
         keys.dedup();
-        assert_eq!(keys.len(), 8);
+        assert_eq!(keys.len(), 9);
     }
 
     #[test]
@@ -411,6 +432,7 @@ mod tests {
         assert!(!AgentRole::RlmModel.is_smart_tier());
         assert!(!AgentRole::RlmVerifier.is_smart_tier());
         assert!(!AgentRole::PlanningWriter.is_smart_tier());
+        assert!(!AgentRole::PlanReviewer.is_smart_tier());
         assert!(AgentRole::Thinker.is_smart_tier());
         assert!(AgentRole::Reviewer.is_smart_tier());
         assert!(AgentRole::ExecutorReviewer.is_smart_tier());
@@ -453,8 +475,7 @@ mod tests {
     fn test_thinker_is_slim_after_brief() {
         let spec = AgentRole::Thinker.spec();
         assert!(spec.allowed_tools.contains(&"request_rlm_research".to_string()));
-        assert!(spec.allowed_tools.contains(&"submit_plan_review".to_string()));
-        for forbidden in ["list_dir", "grep_search", "rlm_python", "run_command", "multi_replace_file", "batch_file_read", "write_file"] {
+        for forbidden in ["list_dir", "grep_search", "rlm_python", "run_command", "multi_replace_file", "batch_file_read", "write_file", "submit_plan_review", "submit_plan"] {
             assert!(
                 !spec.allowed_tools.contains(&forbidden.to_string()),
                 "slim Thinker must not have I/O exploration or mutation tool {}",
@@ -499,5 +520,19 @@ mod tests {
         }
         // It is a cheap-tier role that does the bulk writing.
         assert!(!AgentRole::PlanningWriter.is_smart_tier());
+    }
+
+    #[test]
+    fn test_plan_reviewer_spec() {
+        let spec = AgentRole::PlanReviewer.spec();
+        assert!(spec.allowed_tools.contains(&"submit_plan_review".to_string()));
+        for forbidden in ["write_file", "multi_replace_file", "submit_plan", "batch_file_read", "run_command"] {
+            assert!(
+                !spec.allowed_tools.contains(&forbidden.to_string()),
+                "PlanReviewer must not have tool {}",
+                forbidden
+            );
+        }
+        assert!(!AgentRole::PlanReviewer.is_smart_tier());
     }
 }
