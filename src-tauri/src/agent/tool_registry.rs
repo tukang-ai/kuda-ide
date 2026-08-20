@@ -636,11 +636,24 @@ impl Tool for MultiReplaceFileTool {
         // 1. Read current full file
         let current_payload = FileSystemIO::read_file(&target_path, &ctx.project_root, None, None)?;
         let mut content = current_payload.content;
+        let line_starts_initial = line_byte_starts(&content);
+        let total_lines_initial = line_starts_initial.len().max(1);
 
-        // 1b. Validate every chunk's line range BEFORE any I/O or overlap
-        // analysis: lines are 1-indexed, so 0 anywhere is invalid. Checking it
-        // here (instead of skipping such chunks in the overlap loop and
-        // failing later in the apply loop) rejects the whole request up front.
+        // 1b. Normalize 0-indexed or unprovided line ranges (e.g. 0-0) to the full file range.
+        let mut chunks = chunks;
+        for c in &mut chunks {
+            if c.start_line == 0 && c.end_line == 0 {
+                c.start_line = 1;
+                c.end_line = total_lines_initial;
+            } else if c.start_line == 0 {
+                c.start_line = 1;
+            } else if c.end_line == 0 {
+                c.end_line = total_lines_initial;
+            }
+        }
+
+        // 1c. Validate every chunk's line range BEFORE any I/O or overlap
+        // analysis: lines are 1-indexed, so 0 anywhere is invalid.
         if let Some(chunk) = chunks
             .iter()
             .find(|c| c.start_line == 0 || c.end_line == 0)
@@ -655,11 +668,7 @@ impl Tool for MultiReplaceFileTool {
             });
         }
 
-        // 1c. Reject overlapping chunk line ranges BEFORE applying. Bottom-up
-        // application only works when the chunks are disjoint: an overlapping
-        // chunk would rewrite content that the other chunk's declared range
-        // also covers, so the upper chunk's target_content would no longer be
-        // found and the edit fails midway.
+        // 1d. Reject overlapping chunk line ranges BEFORE applying when there are multiple chunks.
         let mut sorted_by_start: Vec<&ReplacementChunk> = chunks.iter().collect();
         sorted_by_start.sort_by_key(|c| c.start_line);
         let mut prev_end = 0usize;
@@ -1918,6 +1927,47 @@ mod tests {
         assert!(
             new_content.contains("\nA\nb\nSAME\n"),
             "only line 2 must change, got: {:?}",
+            new_content
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_multi_replace_auto_normalizes_zero_line_range() {
+        let temp_dir = std::env::temp_dir().join("kuda_multi_replace_zero_range_test");
+        let project_root = temp_dir.join("project");
+        let app_data = temp_dir.join("app_data");
+        let _ = std::fs::create_dir_all(&project_root);
+        let _ = std::fs::create_dir_all(&app_data);
+        let target = project_root.join("plan.md");
+        let _ = std::fs::write(&target, "# Goal\n\nsqlx = { version = \"0.8\", features = [\"macros\"] }\n\n## End\n");
+
+        let ctx = ToolContext {
+            project_root: project_root.clone(),
+            app_data_dir: app_data.clone(),
+            external_requests: Arc::new(ExternalRequestRegistry::new()),
+            plan_decisions: Arc::new(PlanDecisionRegistry::new()),
+            direction_decisions: Arc::new(DirectionDecisionRegistry::new()),
+            session_id: None,
+            cancel: CancelFlag::new(),
+        };
+        let tool = MultiReplaceFileTool;
+        let params = serde_json::json!({
+            "target_file": "plan.md",
+            "replacement_chunks": [{
+                "start_line": 0,
+                "end_line": 0,
+                "target_content": "features = [\"macros\"]",
+                "replacement_content": "features = [\"macros\", \"migrate\"]"
+            }]
+        });
+        let res = tool.execute(params, &ctx).await.unwrap();
+        assert!(res.success, "{}", res.output);
+        let new_content = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            new_content.contains("features = [\"macros\", \"migrate\"]"),
+            "got: {:?}",
             new_content
         );
 

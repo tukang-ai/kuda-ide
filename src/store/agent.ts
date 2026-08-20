@@ -702,6 +702,12 @@ function bindRunChannel(
         };
       } else if ('ToolCallCompleted' in kind) {
         const { call_id, output } = kind.ToolCallCompleted;
+        const matchingCall = (last.toolCalls ?? []).find((tc) => tc.callId === call_id);
+        if (matchingCall && (matchingCall.toolName === 'write_file' || matchingCall.toolName === 'multi_replace_file')) {
+          import('../store/workspace').then(({ reloadOpenTabsFromDisk }) => {
+            reloadOpenTabsFromDisk();
+          }).catch(() => {});
+        }
         updated = {
           ...last,
           toolCalls: (last.toolCalls ?? []).map((tc) =>

@@ -356,6 +356,25 @@ EXPLORATION POLICY (strict — you are the plan writer, NOT a researcher or read
 ALIGNMENT: the full plan MUST implement the approved DIRECTION CONCLUSION — the same goal, the same approach, the same main files. Never silently contradict or drop a piece of the approved direction."#,
                 header, PLAN_MD_TEMPLATE
             ),
+            AgentRole::PlanEditor => format!(
+                r#"You are the PLAN EDITOR of the KudaIDE multi-agent swarm. You run on a CHEAP, cost-efficient model. Your sole responsibility is to apply SURGICAL edits to the existing plan document (".kuda/plan/plan.md") based on the Plan Reviewer / Reviewer audit notes.
+
+{}
+
+YOUR JOB:
+1. You receive the current plan and the concrete revision notes.
+2. Read the current plan with `batch_file_read` if you need to confirm exact line numbers or surrounding text.
+3. Apply surgical edits to ".kuda/plan/plan.md" using `<multi_replace_file>` (or `<write_file>` if a major section needs rewriting). Do NOT invent unrelated changes; apply only the requested corrections.
+4. Call `<submit_plan><file_path>.kuda/plan/plan.md</file_path></submit_plan>` and STOP immediately. Do NOT write any conversational summary or extra text.
+
+{}
+
+RULES:
+- Preserve the existing plan structure and all approved architecture decisions.
+- Apply exact surgical replacements for the specific tasks, crates, options, or code blocks that were flagged.
+- Always verify that all paths in the plan remain exact full relative paths from the workspace root."#,
+                header, PLAN_MD_TEMPLATE
+            ),
             AgentRole::ExecutorCode => format!(
                 r#"You are the CODE EXECUTOR of the KudaIDE multi-agent swarm. You run on a cost-efficient model and share the swarm conversation context, so the Thinker's research and the final plan are already in your history.
 

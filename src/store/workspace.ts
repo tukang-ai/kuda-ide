@@ -236,8 +236,10 @@ export function watchProject(): () => void {
   const channel = new Channel<ipc.FsEvent>();
   channel.onmessage = (event) => {
     if ('Modified' in event) {
+      const raw = (event as { Modified: string | string[] }).Modified;
+      const paths = Array.isArray(raw) ? raw : [raw];
       const { tabs } = useWorkspace.getState();
-      for (const path of event.Modified) {
+      for (const path of paths) {
         const tab = tabs.find((t) => t.path === path);
         if (!tab) continue;
         // Never clobber unsaved edits in the editor.

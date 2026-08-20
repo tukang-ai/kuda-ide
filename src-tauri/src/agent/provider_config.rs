@@ -51,6 +51,9 @@ pub struct AgentConfig {
     /// Can be configured separately (cheap/medium/smart) to save Thinker tokens.
     #[serde(default)]
     pub plan_reviewer: ModelRef,
+    /// Plan Editor: applies surgical revisions to the plan document on the cheap tier.
+    #[serde(default)]
+    pub plan_editor: ModelRef,
     #[serde(default)]
     pub executor_code: ModelRef,
     #[serde(default)]
@@ -79,6 +82,7 @@ impl Default for AgentConfig {
             reviewers: vec![ModelRef::default()],
             planning_writer: ModelRef::default(),
             plan_reviewer: ModelRef::default(),
+            plan_editor: ModelRef::default(),
             executor_code: ModelRef::default(),
             executor_design: ModelRef::default(),
             executor_reviewer: ModelRef::default(),
@@ -109,6 +113,8 @@ impl Default for ProviderConfig {
             "planning_writer_plus".to_string(),
             "plan_reviewer".to_string(),
             "plan_reviewer_plus".to_string(),
+            "plan_editor".to_string(),
+            "plan_editor_plus".to_string(),
             "executor_code".to_string(),
             "executor_code_plus".to_string(),
             "executor_design".to_string(),
@@ -133,6 +139,7 @@ impl Default for ProviderConfig {
                 reviewers: vec![bind("reviewer")],
                 planning_writer: bind("planning_writer"),
                 plan_reviewer: bind("plan_reviewer"),
+                plan_editor: bind("plan_editor"),
                 executor_code: bind("executor_code"),
                 executor_design: bind("executor_design"),
                 executor_reviewer: bind("executor_reviewer"),
@@ -173,6 +180,12 @@ impl ProviderConfigManager {
             cfg.agent.plan_reviewer = ModelRef {
                 provider_id: "kuda_hub".to_string(),
                 model: "plan_reviewer".to_string(),
+            };
+        }
+        if cfg.agent.plan_editor.provider_id.is_empty() {
+            cfg.agent.plan_editor = ModelRef {
+                provider_id: "kuda_hub".to_string(),
+                model: "plan_editor".to_string(),
             };
         }
         Ok(cfg)

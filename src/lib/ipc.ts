@@ -281,6 +281,7 @@ export interface AgentConfig {
   reviewers: ModelRef[];
   planning_writer: ModelRef;
   plan_reviewer?: ModelRef;
+  plan_editor?: ModelRef;
   executor_code: ModelRef;
   executor_design: ModelRef;
   executor_reviewer: ModelRef;

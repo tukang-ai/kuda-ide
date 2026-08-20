@@ -130,6 +130,7 @@ export type AgentRoleKey =
   | 'reviewer'
   | 'planning_writer'
   | 'plan_reviewer'
+  | 'plan_editor'
   | 'executor_code'
   | 'executor_design'
   | 'executor_reviewer'

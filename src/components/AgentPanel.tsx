@@ -59,6 +59,7 @@ const ROLE_META: Record<string, { name: string; color: string }> = {
   reviewer: { name: 'Reviewer', color: '#38bdf8' },
   planning_writer: { name: 'Planning Writer', color: '#2dd4bf' },
   plan_reviewer: { name: 'Plan Reviewer', color: '#c084fc' },
+  plan_editor: { name: 'Plan Editor', color: '#10b981' },
   executor_code: { name: 'Executor Code', color: '#fbbf24' },
   executor_design: { name: 'Executor Design', color: '#f472b6' },
   executor_reviewer: { name: 'Executor Reviewer', color: '#34d399' },

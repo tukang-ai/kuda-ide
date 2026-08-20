@@ -14,6 +14,7 @@ pub enum AgentRole {
     Reviewer,
     PlanningWriter,
     PlanReviewer,
+    PlanEditor,
     ExecutorCode,
     ExecutorDesign,
     ExecutorReviewer,
@@ -28,6 +29,7 @@ impl AgentRole {
             AgentRole::Reviewer => "reviewer",
             AgentRole::PlanningWriter => "planning_writer",
             AgentRole::PlanReviewer => "plan_reviewer",
+            AgentRole::PlanEditor => "plan_editor",
             AgentRole::ExecutorCode => "executor_code",
             AgentRole::ExecutorDesign => "executor_design",
             AgentRole::ExecutorReviewer => "executor_reviewer",
@@ -42,6 +44,7 @@ impl AgentRole {
             AgentRole::Reviewer => "Reviewer",
             AgentRole::PlanningWriter => "Planning Writer",
             AgentRole::PlanReviewer => "Plan Reviewer",
+            AgentRole::PlanEditor => "Plan Editor",
             AgentRole::ExecutorCode => "Executor Code",
             AgentRole::ExecutorDesign => "Executor Design",
             AgentRole::ExecutorReviewer => "Executor Reviewer",
@@ -66,6 +69,17 @@ impl AgentRole {
                 temperature: 0.1,
                 allowed_tools: vec![
                     "submit_plan_review".into(),
+                ],
+            },
+            AgentRole::PlanEditor => RoleSpec {
+                role: *self,
+                max_turns: 12,
+                temperature: 0.1,
+                allowed_tools: vec![
+                    "batch_file_read".into(),
+                    "multi_replace_file".into(),
+                    "write_file".into(),
+                    "submit_plan".into(),
                 ],
             },
             AgentRole::PlanningWriter => RoleSpec {
@@ -216,6 +230,7 @@ fn role_model_refs(role: AgentRole, cfg: &crate::agent::provider_config::AgentCo
         AgentRole::Thinker => vec![cfg.thinker.clone()],
         AgentRole::PlanningWriter => vec![cfg.planning_writer.clone()],
         AgentRole::PlanReviewer => vec![cfg.plan_reviewer.clone()],
+        AgentRole::PlanEditor => vec![cfg.plan_editor.clone()],
         AgentRole::Reviewer => {
             let mut refs = cfg.reviewers.clone();
             if refs.is_empty() {
@@ -534,5 +549,22 @@ mod tests {
             );
         }
         assert!(!AgentRole::PlanReviewer.is_smart_tier());
+    }
+
+    #[test]
+    fn test_plan_editor_spec() {
+        let spec = AgentRole::PlanEditor.spec();
+        assert!(spec.allowed_tools.contains(&"submit_plan".to_string()));
+        assert!(spec.allowed_tools.contains(&"batch_file_read".to_string()));
+        assert!(spec.allowed_tools.contains(&"multi_replace_file".to_string()));
+        assert!(spec.allowed_tools.contains(&"write_file".to_string()));
+        for forbidden in ["list_dir", "grep_search", "code_outline", "rlm_python", "run_command"] {
+            assert!(
+                !spec.allowed_tools.contains(&forbidden.to_string()),
+                "PlanEditor must not have tool {}",
+                forbidden
+            );
+        }
+        assert!(!AgentRole::PlanEditor.is_smart_tier());
     }
 }

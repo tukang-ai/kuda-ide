@@ -2538,11 +2538,11 @@ impl SwarmOrchestrator {
         let reviewer_provider = resolve_role_provider(AgentRole::Reviewer, app_data_dir).await?;
         let plan_reviewer_provider =
             resolve_role_provider(AgentRole::PlanReviewer, app_data_dir).await?;
-        let writer_provider =
-            resolve_role_provider(AgentRole::PlanningWriter, app_data_dir).await?;
+        let editor_provider =
+            resolve_role_provider(AgentRole::PlanEditor, app_data_dir).await?;
         let reviewer_spec = AgentRole::Reviewer.spec();
         let plan_reviewer_spec = AgentRole::PlanReviewer.spec();
-        let writer_spec = AgentRole::PlanningWriter.spec();
+        let editor_spec = AgentRole::PlanEditor.spec();
 
         let mut final_plan = plan.clone();
         let mut reviewed = false;
@@ -2718,17 +2718,17 @@ impl SwarmOrchestrator {
                 break;
             }
 
-            // ── Planning Writer: rewrite the plan per the Plan Reviewer's notes ──
+            // ── Plan Editor: rewrite the plan per the Plan Reviewer's notes ──
             let notes = notes.unwrap_or_default();
             let (plan_path, plan_file_path) = resolve_plan_path(project_root);
             let disk_raw = std::fs::read_to_string(&plan_path).ok().filter(|s| !s.trim().is_empty());
             let plan_md = disk_raw.unwrap_or_else(|| render_plan_markdown(&final_plan));
-            let mut writer_ctx: Vec<Message> = shared.to_vec();
-            writer_ctx.push(Message::user(format!(
+            let mut editor_ctx: Vec<Message> = shared.to_vec();
+            editor_ctx.push(Message::user(format!(
                 "[PLAN SAAT INI]\n{}",
                 plan_md
             )));
-            writer_ctx.push(Message::user(format!(
+            editor_ctx.push(Message::user(format!(
                 "[PLAN REVIEWER REVISION REQUEST — berdasarkan arahan Reviewer utama] Terapkan \
                  koreksi berikut dengan mengedit {} secara SURGICAL menggunakan \
                  multi_replace_file (jangan tulis ulang seluruh file), lalu panggil \
@@ -2738,36 +2738,36 @@ impl SwarmOrchestrator {
                 notes
             )));
             emit(AgentEventKind::PhaseStarted {
-                role: AgentRole::PlanningWriter.key().to_string(),
-                label: format!("Planning Writer: menulis ulang plan (round {})", round + 1),
-                model: writer_provider.name().to_string(),
+                role: AgentRole::PlanEditor.key().to_string(),
+                label: format!("Plan Editor: merevisi plan secara surgical (round {})", round + 1),
+                model: editor_provider.name().to_string(),
             });
-            let writer_outcome = self
+            let editor_outcome = self
                 .inner
                 .run_role_loop(
                     RoleLoopParams {
                         system_prompt:
-                            PromptComposer::compose_role_prompt(AgentRole::PlanningWriter, project_root),
-                        messages: writer_ctx,
-                        allowed_tools: &writer_spec.allowed_tools,
-                        provider: writer_provider.clone(),
-                        max_turns: writer_spec.max_turns,
-                        temperature: writer_spec.temperature,
+                            PromptComposer::compose_role_prompt(AgentRole::PlanEditor, project_root),
+                        messages: editor_ctx,
+                        allowed_tools: &editor_spec.allowed_tools,
+                        provider: editor_provider.clone(),
+                        max_turns: editor_spec.max_turns,
+                        temperature: editor_spec.temperature,
                         stop_on_tool: Some("submit_plan"),
-                        role_name: AgentRole::PlanningWriter.key(),
+                        role_name: AgentRole::PlanEditor.key(),
                     },
                     tool_ctx,
                     auto_approve,
                     emit,
                 )
                 .await?;
-            *total_tokens += writer_outcome.tokens_used;
-            *total_tokens_in += writer_outcome.tokens_in;
-            *total_cached_in += writer_outcome.cached_in;
-            *total_tokens_out += writer_outcome.tokens_out;
+            *total_tokens += editor_outcome.tokens_used;
+            *total_tokens_in += editor_outcome.tokens_in;
+            *total_cached_in += editor_outcome.cached_in;
+            *total_tokens_out += editor_outcome.tokens_out;
             let mut rewrote = false;
-            if let Some(ref args) = writer_outcome.stop_tool_args {
-                if let Ok(doc) = handoff_doc(project_root, args, &writer_outcome.final_text) {
+            if let Some(ref args) = editor_outcome.stop_tool_args {
+                if let Ok(doc) = handoff_doc(project_root, args, &editor_outcome.final_text) {
                     if let Ok(p) = parse_plan_doc(&doc) {
                         final_plan = p;
                         rewrote = true;
@@ -2775,15 +2775,15 @@ impl SwarmOrchestrator {
                 }
             }
             emit(AgentEventKind::PhaseCompleted {
-                role: AgentRole::PlanningWriter.key().to_string(),
+                role: AgentRole::PlanEditor.key().to_string(),
                 summary: if rewrote {
-                    format!("Plan ditulis ulang: {} task(s)", final_plan.tasks.len())
+                    format!("Plan direvisi oleh Plan Editor: {} task(s)", final_plan.tasks.len())
                 } else {
-                    "Gagal menulis ulang — mempertahankan plan sebelumnya".to_string()
+                    "Gagal merevisi — mempertahankan plan sebelumnya".to_string()
                 },
-                tokens_in: writer_outcome.tokens_in,
-                tokens_out: writer_outcome.tokens_out,
-                cached_in: writer_outcome.cached_in,
+                tokens_in: editor_outcome.tokens_in,
+                tokens_out: editor_outcome.tokens_out,
+                cached_in: editor_outcome.cached_in,
             });
             if !rewrote {
                 break;
