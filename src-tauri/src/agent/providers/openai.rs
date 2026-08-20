@@ -193,8 +193,13 @@ impl LlmProvider for OpenAiProvider {
                                             }
                                         }
 
-                                        // 2. Reasoning delta (DeepSeek / QwQ / Kimi)
-                                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
+                                        // 2. Reasoning delta (DeepSeek / QwQ / Kimi / OpenRouter / OpenAI)
+                                        let reasoning_opt = delta
+                                            .get("reasoning_content")
+                                            .or_else(|| delta.get("reasoning"))
+                                            .or_else(|| delta.get("thought"))
+                                            .and_then(|r| r.as_str());
+                                        if let Some(reasoning) = reasoning_opt {
                                             if !reasoning.is_empty() {
                                                 out.push(Ok(StreamChunk {
                                                     kind: ChunkKind::ReasoningDelta(reasoning.to_string()),
@@ -428,6 +433,11 @@ fn build_openai_body(request: &CompletionRequest, model_name: &str) -> serde_jso
         // silently fall back to the local tokenizer estimate (cached_in = 0).
         "stream_options": { "include_usage": true }
     });
+
+    let model_lower = model_name.to_lowercase();
+    if model_lower.contains("deepseek") || model_lower.contains("v4") || model_lower.contains("think") {
+        body["thinking"] = serde_json::json!({ "type": "enabled" });
+    }
 
     // 2b. Max output tokens: default to 120k tokens so long plans/responses
     // are not prematurely truncated at the server default 4096 cap.
