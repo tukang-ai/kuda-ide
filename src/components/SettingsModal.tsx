@@ -318,7 +318,10 @@ export const SettingsModal: React.FC = () => {
   const [buyingPackageId, setBuyingPackageId] = useState<string | null>(null);
 
   const buyBoosterPackage = async (plan: { id: string; name: string; price: string }) => {
-    // Ambil email dari hubAccount atau fallback ke userUsage/localStorage
+    // Email WAJIB dari akun hub yang benar-benar terhubung. Tidak ada lagi
+    // fallback 'dev@kuda.ide' / tebakan dari usage: invoice dengan email
+    // yang tidak dikenal server membuat booster terkredit ke akun hantu
+    // (uang hangus) atau order stuck retry selamanya.
     let email = hubAccount?.email;
     if (!email) {
       try {
@@ -328,11 +331,10 @@ export const SettingsModal: React.FC = () => {
         /* ignore */
       }
     }
-    if (!email && userUsage?.user_id && userUsage.user_id.includes('@')) {
-      email = userUsage.user_id;
-    }
     if (!email) {
-      email = 'dev@kuda.ide';
+      setNote('Hubungkan akun Kuda Hub terlebih dahulu sebelum membeli paket booster.');
+      setBuyingPackageId(null);
+      return;
     }
 
     const amountNum = parseInt(plan.price.replace(/[^0-9]/g, ''), 10) || 10000;
