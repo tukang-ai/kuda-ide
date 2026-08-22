@@ -56,7 +56,15 @@ impl HubCredentialStore {
 
     pub fn save(app_data_dir: &Path, creds: &HubCredentials) -> std::io::Result<()> {
         let path = Self::path(app_data_dir);
-        let json = serde_json::to_string_pretty(creds).unwrap_or_default();
+        // Propagate serialization failure: falling back to an empty string
+        // used to rename an EMPTY file over the valid credential store,
+        // silently destroying the master token (permanent lockout).
+        let json = serde_json::to_string_pretty(creds).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to serialize hub credentials: {}", e),
+            )
+        })?;
         // Atomic write (temp file + rename) so a crash mid-write can never
         // truncate the master token store.
         let tmp = app_data_dir.join(format!(".hub_credentials.json.tmp.{}", std::process::id()));
