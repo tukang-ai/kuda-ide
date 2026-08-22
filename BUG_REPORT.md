@@ -144,9 +144,7 @@ Commit: `97e3707` (batch 1–3) dan `8b0d4d5` (batch 4) pada `main`.
 | R4 | Block `import sys` transitif membuat beberapa paket stdlib murni (`multiprocessing`, `runpy`, `pickle`) gagal impor | Ini justru salah satu penghalang kecelakaan menuju spawn; melonggarkan butuh testing luas |
 | R5 | PKCE verifier dikirim di **query-string** `/auth/pending?verifier=…` (berpotensi masuk access log Cloudflare) | Kontrak API hub sisi server; butuh dukungan header/body dari server sebelum klien berubah |
 | R6 | Sign Out tidak melakukan revoke sisi server (master token tetap valid di hub) | Belum ada endpoint revoke yang diketahui di hub; butuh koordinasi backend |
-| R7 | Kredensial hub plaintext di Windows tanpa ACL ketat; `serde_json::to_string_pretty(...).unwrap_or_default()` berpotensi menimpa kredensial dengan file kosong bila serialize gagal | Hardening Windows-specific + perbaikan satu-baris `unwrap_or_default()` belum dieksekusi di batch ini |
-
-> Catatan R7 bagian kedua (`unwrap_or_default`) adalah perbaikan satu baris yang layak di-pick cepat.
+| R7 | Kredensial hub plaintext di Windows tanpa ACL ketat | Hardening Windows-specific (ACL/keyring) belum dieksekusi. *Sub-item `unwrap_or_default()` sudah diperbaiki di commit `021fea6`.* |
 
 ---
 
