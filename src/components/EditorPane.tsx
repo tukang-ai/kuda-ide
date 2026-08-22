@@ -6,14 +6,26 @@ import type { OpenTab } from '../types';
 
 const openModels = new Map<string, monaco.editor.ITextModel>();
 
+/** Replaces the model's full content WITHOUT `setValue`, which wipes the undo
+ * stack and cursor position. A pushed edit operation keeps both intact, so an
+ * external reload stays reversible with Cmd+Z. */
+function replaceModelValue(model: monaco.editor.ITextModel, next: string) {
+  if (model.getValue() === next) return;
+  model.pushEditOperations(
+    [],
+    [{ range: model.getFullModelRange(), text: next }],
+    () => null,
+  );
+}
+
 function getModel(tab: OpenTab): monaco.editor.ITextModel {
   const uri = monaco.Uri.file(tab.path);
   let model = openModels.get(tab.path) ?? monaco.editor.getModel(uri);
   if (!model) {
     model = monaco.editor.createModel(tab.content, tab.language, uri);
     openModels.set(tab.path, model);
-  } else if (model.getValue() !== tab.content) {
-    model.setValue(tab.content);
+  } else {
+    replaceModelValue(model, tab.content);
   }
   return model;
 }
@@ -66,6 +78,11 @@ export const EditorPane: React.FC = () => {
     return () => {
       editor.dispose();
       editorRef.current = null;
+      // Dispose every tracked model: on project close `tabs` is cleared and
+      // this component unmounts in the SAME commit, so the tabs-diff cleanup
+      // effect never runs and all document snapshots leaked.
+      for (const [, model] of openModels) model.dispose();
+      openModels.clear();
     };
   }, [saveFile, updateContent]);
 
@@ -112,9 +129,9 @@ export const EditorPane: React.FC = () => {
     for (const path of Object.keys(reloadingFromDisk)) {
       const tab = useWorkspace.getState().tabs.find((t) => t.path === path);
       const model = openModels.get(path);
-      if (tab && model && model.getValue() !== tab.content) {
+      if (tab && model) {
         suppressChange.current = true;
-        model.setValue(tab.content);
+        replaceModelValue(model, tab.content);
         suppressChange.current = false;
       }
     }

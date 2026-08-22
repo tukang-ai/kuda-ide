@@ -61,6 +61,7 @@ pub fn run() {
             // Agent
             commands::agent::agent_chat,
             commands::agent::agent_swarm_chat,
+            commands::agent::agent_coordinator_chat,
             commands::agent::agent_resume_run,
             commands::agent::agent_get_config,
             commands::agent::agent_delete_config,

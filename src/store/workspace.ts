@@ -236,7 +236,7 @@ export function watchProject(): () => void {
   const channel = new Channel<ipc.FsEvent>();
   channel.onmessage = (event) => {
     if ('Modified' in event) {
-      const raw = (event as { Modified: string | string[] }).Modified;
+      const raw: string = event.Modified;
       const paths = Array.isArray(raw) ? raw : [raw];
       const { tabs } = useWorkspace.getState();
       for (const path of paths) {

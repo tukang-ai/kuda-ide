@@ -60,11 +60,29 @@ pub fn open_external_url(url: String) -> std::result::Result<(), String> {
         return Err("Refusing to open non-http(s) URL".to_string());
     }
 
+    // The URL is passed to OS launchers that may interpret shell metacharacters
+    // (notably `cmd /C start ...` on Windows, where `&` splits commands). Reject
+    // any control character, whitespace and common metacharacter so a hostile
+    // hub URL can never smuggle a second command.
+    if trimmed.chars().any(|c| {
+        c.is_control()
+            || matches!(c, ' ' | '\t' | '"' | '\'' | '&' | '|' | ';' | '<' | '>' | '^' | '%' | '$' | '`' | '(' | ')' | '!' | '{' | '}' | '*' | '?' | '[' | ']' | '#' | '~' | '\\')
+    }) {
+        return Err("Refusing to open URL with unsafe characters".to_string());
+    }
+
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(&url).spawn();
 
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd").args(["/C", "start", &url]).spawn();
+    {
+        // Even with the character filter above, avoid `cmd` entirely:
+        // SysCreateObject / rundll32 route through the shell association
+        // handler without an intermediate command interpreter.
+        let _ = std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", &url])
+            .spawn();
+    }
 
     #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("xdg-open").arg(&url).spawn();

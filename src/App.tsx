@@ -62,6 +62,19 @@ export const App: React.FC = () => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
       if (!mod) return;
+      const target = e.target as HTMLElement | null;
+      // Don't hijack shortcuts typed inside text fields / Monaco: Cmd+I is the
+      // native italic binding in editors, and swallowing keystrokes mid-edit
+      // made panel toggles fire unintentionally while typing.
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.isContentEditable ||
+          target.closest('.monaco-editor'))
+      ) {
+        return;
+      }
       const key = e.key.toLowerCase();
       if (key === 'j') {
         e.preventDefault();

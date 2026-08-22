@@ -96,6 +96,32 @@ impl LlmProvider for GeminiProvider {
                     }
                     Ok(ev) => {
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&ev.data) {
+                            // Surface truncation / safety blocking: without
+                            // this, a MAX_TOKENS or SAFETY cut produced zero
+                            // candidates and a bare `Done`, so a HALF-WRITTEN
+                            // plan was treated as complete. Mirrors OpenAI's
+                            // finish_reason:length handling.
+                            if let Some(reason) = json
+                                .pointer("/candidates/0/finishReason")
+                                .and_then(|r| r.as_str())
+                            {
+                                if reason != "STOP" {
+                                    out.push(Err(AppError::General(format!(
+                                        "[origin-close] Gemini stream ended prematurely \
+                                         (finishReason: {}) — response truncated or blocked",
+                                        reason
+                                    ))));
+                                }
+                            }
+                            if let Some(block) = json
+                                .pointer("/promptFeedback/blockReason")
+                                .and_then(|b| b.as_str())
+                            {
+                                out.push(Err(AppError::General(format!(
+                                    "[origin-close] Gemini blocked the request (blockReason: {})",
+                                    block
+                                ))));
+                            }
                             if let Some(parts) = json
                                 .pointer("/candidates/0/content/parts")
                                 .and_then(|p| p.as_array())
@@ -126,6 +152,16 @@ impl LlmProvider for GeminiProvider {
                                     }
                                 }
                             }
+                        } else if !ev.data.trim().is_empty() {
+                            // A malformed/truncated frame means streamed content
+                            // (possibly tool-call args) was LOST. Failing loudly
+                            // beats silently corrupting the assembled arguments
+                            // downstream.
+                            out.push(Err(AppError::General(format!(
+                                "[origin-parse] Gemini sent a non-JSON SSE frame ({} bytes) — \
+                                 stream content may be incomplete",
+                                ev.data.len()
+                            ))));
                         }
                     }
                     Err(e) => {

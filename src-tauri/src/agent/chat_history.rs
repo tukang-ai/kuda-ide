@@ -80,17 +80,48 @@ pub struct ChatHistoryManager {
 /// writes are rare and small; the lock is only held during load+save.
 pub(crate) static SESSION_IO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Locks `SESSION_IO_LOCK`, recovering from poisoning. A panic in one task
+/// while holding this lock must not brick chat persistence forever: the mutex
+/// only serializes read-modify-write cycles, and every write is atomic
+/// (temp + fsync + rename), so the on-disk state is always either the old or
+/// the new complete file — resuming after a poisoned guard is safe.
+pub(crate) fn session_io_lock() -> std::sync::MutexGuard<'static, ()> {
+    SESSION_IO_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Atomic file write (temp + fsync + rename) so a crash mid-write can never
 /// truncate a session file that holds the turn ledger / context.
 fn write_file_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("json.tmp");
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        // 0600 (unix): transcripts may contain secrets the user pasted into
+        // the conversation; every other credential-bearing store in this
+        // codebase is already mode-gated.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
         f.write_all(contents.as_bytes())?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    let result = std::fs::rename(&tmp, path);
+    if result.is_ok() {
+        // Tighten pre-existing files too: sessions written by older builds
+        // may still be 0644 on disk.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    result
 }
 
 impl ChatHistoryManager {
@@ -143,7 +174,7 @@ impl ChatHistoryManager {
 
     /// Saves or updates a Chat Session JSON file on disk (atomic, serialized).
     pub fn save_session(&self, session: &ChatSessionData) -> Result<()> {
-        let _guard = SESSION_IO_LOCK.lock().unwrap();
+        let _guard = session_io_lock();
         self.save_session_unlocked(session)
     }
 
@@ -190,7 +221,7 @@ impl ChatHistoryManager {
 
     /// Appends a message to an existing session and updates timestamp
     pub fn append_message(&self, session_id: &str, message: Message, checkpoint_id: Option<String>) -> Result<ChatSessionData> {
-        let _guard = SESSION_IO_LOCK.lock().unwrap();
+        let _guard = session_io_lock();
         let mut session = self.load_session(session_id)?;
         
         // Auto-generate title from first user message if default
@@ -226,7 +257,7 @@ impl ChatHistoryManager {
         if records.is_empty() {
             return Ok(());
         }
-        let _guard = SESSION_IO_LOCK.lock().unwrap();
+        let _guard = session_io_lock();
         let mut session = self.load_session(session_id)?;
         session.transcript.extend(records.iter().cloned());
         session.meta.updated_at = Utc::now();

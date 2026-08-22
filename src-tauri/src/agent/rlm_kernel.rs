@@ -47,14 +47,19 @@ use crate::agent::tool_registry::{Tool, ToolContext, ToolDefinition, ToolResult}
 ///      module) with the introspection / process-exit primitives stripped, so
 ///      `__builtins__['open'] = ...` cannot poison later calls.
 ///
-/// Residual risk (documented, not closable in-process): the whitelisted helpers
-/// (`_rlm_load` etc.) are ordinary Python functions, and Python exposes
-/// `__globals__`/`__closure__`/`__defaults__` to direct attribute access. A
-/// hostile model can therefore still reach the patched `os`/`open` and, through
-/// their closures, the saved originals. True isolation requires the kernel to
-/// run in a separate OS sandbox with no secrets on disk. `_rlm_install_guard()`
-/// is kept callable and is re-run before every `execute_user_code` so any
-/// module/builtins mutation a previous snippet performed is rolled back.
+/// Residual risk (mitigated, see below): the whitelisted helpers (`_rlm_load`
+/// etc.) are ordinary Python functions, and Python exposes `__globals__`/
+/// `__closure__`/`__defaults__` to direct attribute access. A hostile model can
+/// therefore still reach the patched `os`/`open` and, through their closures,
+/// the saved originals. Mitigation: a PEP 578 `sys` audit hook is installed
+/// ONCE per kernel process and polices EVERY `open`/`open_code` call at the
+/// interpreter level — including calls made through an extracted raw builtin —
+/// plus all process-execution events. Audit hooks live in CPython-internal
+/// state with no public accessor and `gc`/`inspect` are blocked, so the hook is
+/// unreachable from model code. True OS-level isolation would still require a
+/// separate sandbox. `_rlm_install_guard()` is kept callable and is re-run
+/// before every `execute_user_code` so any module/builtins mutation a previous
+/// snippet performed is rolled back.
 const READONLY_GUARD_PY: &str = r#"
 import io as _io, sys as _sys, importlib as _importlib
 
@@ -116,6 +121,8 @@ _RLM_GUARD_INTERNALS = {
     'open': builtins.open,
     'os_open': os.open,
     'fdopen': os.fdopen,
+    'file_io': _io.FileIO,
+    'open_code': getattr(_io, 'open_code', None),
     'chdir': os.chdir,
     'scandir': os.scandir,
     'walk': os.walk,
@@ -150,6 +157,8 @@ def _rlm_install_guard():
     _orig_open = _RLM_GUARD_INTERNALS['open']
     _orig_os_open = _RLM_GUARD_INTERNALS['os_open']
     _orig_fdopen = _RLM_GUARD_INTERNALS['fdopen']
+    _orig_file_io = _RLM_GUARD_INTERNALS.get('file_io')
+    _orig_open_code = _RLM_GUARD_INTERNALS.get('open_code')
     _orig_chdir = _RLM_GUARD_INTERNALS['chdir']
     _orig_scandir = _RLM_GUARD_INTERNALS['scandir']
     _orig_walk = _RLM_GUARD_INTERNALS['walk']
@@ -342,9 +351,46 @@ def _rlm_install_guard():
     # `builtins.open` rebind above does NOT affect it, so rebind it explicitly.
     _io.open = _safe_open
 
+    # `io.FileIO` constructs raw file objects WITHOUT passing through any
+    # `open` function — left unpatched it reads/writes any path. Route it
+    # through the same scope/denylist/read-only checks. Genuine Python
+    # source/bytecode files are exempt from the scope check (stdlib imports),
+    # but the denylist still applies to them.
+    if _orig_file_io is not None:
+        def _safe_file_io(name, mode='r', *args, **kwargs):
+            _m = mode if isinstance(mode, str) else 'r'
+            if any(_c in _m for _c in ('w', 'a', '+', 'x')):
+                raise ReadOnlyError("RLM Kernel is READ-ONLY: io.FileIO write mode blocked.")
+            _sn = name.decode('utf-8', 'replace') if isinstance(name, bytes) else str(name)
+            if _rlm_is_denied(_sn):
+                raise ReadOnlyError("RLM Kernel SECURITY: io.FileIO denied path: '%s'" % (_sn,))
+            if not _sn.lower().endswith(('.py', '.pyc', '.pyo', '.pyd')):
+                if not _rlm_in_scope(name):
+                    raise ReadOnlyError("RLM Kernel READ BLOCKED_EXTERNAL: io.FileIO outside scope: '%s'" % (name,))
+            return _orig_file_io(name, _m, *args, **kwargs)
+        _io.FileIO = _safe_file_io
+
+    # `io.open_code` (used by the import system, and directly callable) opens
+    # files without going through `open`. The IMPORT SYSTEM legitimately opens
+    # stdlib/site-packages sources OUTSIDE the project scope, so genuine Python
+    # source/bytecode files are allowed (denylist still applies); anything else
+    # (a direct attempt to read e.g. /etc/passwd through open_code) gets the
+    # full scope/denylist treatment.
+    if _orig_open_code is not None:
+        def _safe_open_code(path):
+            _s = path.decode('utf-8', 'replace') if isinstance(path, bytes) else str(path)
+            if _rlm_is_denied(_s):
+                raise ReadOnlyError("RLM Kernel SECURITY: io.open_code denied path: '%s'" % (_s,))
+            if not _s.lower().endswith(('.py', '.pyc', '.pyo', '.pyd')):
+                if not _rlm_in_scope(_s):
+                    raise ReadOnlyError("RLM Kernel READ BLOCKED_EXTERNAL: io.open_code outside scope: '%s'" % (_s,))
+            return _orig_open_code(path)
+        _io.open_code = _safe_open_code
+
     # More mutation / spawn / exec entry points on `os`.
     for _f in ['popen', 'spawnv', 'spawnve', 'spawnl', 'spawnle', 'spawnlp', 'spawnlpe',
-               'spawnvp', 'spawnvpe', 'fork', 'forkpty', 'execv', 'execve', 'execvp',
+               'spawnvp', 'spawnvpe', 'posix_spawn', 'posix_spawnp',
+               'fork', 'forkpty', 'execv', 'execve', 'execvp',
                'execvpe', 'execl', 'execle', 'execlp', 'execlpe', 'startfile']:
         if hasattr(os, _f):
             setattr(os, _f, _block_mutation(_f))
@@ -420,8 +466,11 @@ def _rlm_install_guard():
     # otherwise reach the FULL session globals through
     # `sys.modules['__main__'].__dict__` and mutate `_rlm_allowlist` /
     # `_rlm_project_root`, silently bypassing the external-access gate.
+    # `sqlite3`/`dbm`/`shelve` open files through their own C code, entirely
+    # outside the patched `open`/`os.open` — sqlite3.connect can even CREATE
+    # files (write primitive), so the whole family is refused.
     for _m in ['ctypes', 'cffi', 'socket', 'pty', 'fcntl', 'posix', '_posixsubprocess',
-               'gc', 'inspect']:
+               'gc', 'inspect', 'sqlite3', 'dbm', 'shelve']:
         _sys.modules[_m] = None
 
     # ---- Sandbox hardening -------------------------------------------------------
@@ -471,7 +520,72 @@ def _rlm_install_guard():
     # `sync_kernel_allowlist` / `reset_allowlist` would never take effect).
     globals()['_rlm_in_scope'] = _rlm_in_scope
     globals()['_rlm_is_denied'] = _rlm_is_denied
+    # Refresh the process-wide audit-hook state holder with THIS install's
+    # check closures, so allowlist approvals take effect immediately (see the
+    # audit-hook backstop below).
+    _st = globals().get('_rlm_audit_state')
+    if isinstance(_st, dict):
+        _st['in_scope'] = _rlm_in_scope
+        _st['is_denied'] = _rlm_is_denied
     return (_rlm_in_scope, _rlm_is_denied)
+
+# ---- PEP 578 audit-hook backstop (installed exactly once per kernel process) -
+# Pure-Python wrapping can never fully hide a raw primitive: every wrapper that
+# ultimately calls builtins.open carries it inside an introspectable closure
+# cell (`f.__closure__[i].cell_contents`), so a hostile snippet can walk
+# helper.__globals__['open'].__closure__ and recover `_orig_open`. Countermeasure:
+# a sys audit hook. Hooks are stored in CPython-internal state with no public
+# accessor and `gc`/`inspect` are blocked, so this hook and the state dict it
+# closes over are unreachable from model code — while EVERY open() in the
+# process (including one performed through an extracted raw builtin,
+# io.FileIO/io.open_code, or any future unpatched path) passes through it.
+# `_rlm_install_guard` refreshes the holder above on every re-install so
+# allowlist approvals apply immediately.
+_rlm_audit_state = {}
+
+def _rlm_audit_hook(event, args):
+    st = _rlm_audit_state
+    chk_in = st.get('in_scope')
+    if chk_in is None:
+        return  # guard not initialized yet — only trusted bootstrap runs here
+    if event == 'open' or event == 'open_code':
+        target = args[0] if args else None
+        if isinstance(target, int):
+            return  # fd-based open; fds originate only from the guarded os.open
+        if isinstance(target, bytes):
+            target = target.decode('utf-8', 'replace')
+        deny = st.get('is_denied')
+        # Write modes are blocked EVERYWHERE, no exceptions.
+        mode = args[1] if len(args) > 1 and event == 'open' else ''
+        m = mode if isinstance(mode, str) else ''
+        if m and any(flag in m for flag in ('w', 'a', '+', 'x')):
+            raise ReadOnlyError("RLM Kernel AUDIT: write-mode open is blocked: %r" % (target,))
+        # Denylist applies to every path, raw string first.
+        _s = str(target)
+        if deny is not None and deny(_s):
+            raise ReadOnlyError("RLM Kernel AUDIT SECURITY: '%s' is a sensitive path." % _s)
+        # Python source/bytecode files may legitimately live OUTSIDE the
+        # project scope: stdlib/site-packages IMPORTS read them from anywhere
+        # on sys.path, and some loader paths go straight to the raw syscall
+        # (bypassing every Python-level wrapper), so this hook is the only
+        # enforcement point. Read-only access to genuine source suffixes is
+        # allowed; everything else must pass the full canonical scope check.
+        if not _s.lower().endswith(('.py', '.pyc', '.pyo', '.pyd')):
+            try:
+                rp = os.path.realpath(target)
+            except Exception:
+                rp = _s
+            if not chk_in(rp):
+                raise ReadOnlyError("RLM Kernel AUDIT BLOCKED_EXTERNAL: '%s' is outside the allowed scope." % rp)
+            if deny is not None and deny(rp):
+                raise ReadOnlyError("RLM Kernel AUDIT SECURITY: '%s' is a sensitive path." % rp)
+    elif event in ('os.system', 'subprocess.Popen', 'os.exec', 'os.posix_spawn',
+                   'os.posix_spawnp', 'os.fork', 'os.forkpty',
+                   'socket.connect', 'socket.bind'):
+        raise ReadOnlyError("RLM Kernel AUDIT: '%s' is blocked inside the RLM kernel." % event)
+
+if hasattr(_sys, 'addaudithook'):
+    _sys.addaudithook(_rlm_audit_hook)
 
 (_rlm_in_scope, _rlm_is_denied) = _rlm_install_guard()
 "#;
@@ -1021,6 +1135,16 @@ impl RlmKernelProcess {
 
         let mut output_lines: Vec<String> = Vec::new();
         let mut stderr_lines: Vec<String> = Vec::new();
+        // Capture budget: `while true: print('x'*4096)` used to accumulate
+        // unbounded Rust-side memory until the timeout fired (OOM on a large
+        // user-supplied timeout). Past the cap we KEEP DRAINING the pipe (so
+        // the sentinel still arrives and the kernel stays in sync) but stop
+        // storing.
+        const MAX_CAPTURED_CHARS: usize = 200_000;
+        let mut stdout_captured_chars: usize = 0;
+        let mut stderr_captured_chars: usize = 0;
+        let mut out_dropped: usize = 0;
+        let mut err_dropped: usize = 0;
         let mut found_stdout = false;
         let mut found_stderr = false;
 
@@ -1044,6 +1168,11 @@ impl RlmKernelProcess {
                 if cleaned.trim().is_empty() {
                     continue;
                 }
+                if stdout_captured_chars + cleaned.len() > MAX_CAPTURED_CHARS {
+                    out_dropped += 1;
+                    continue;
+                }
+                stdout_captured_chars += cleaned.len();
                 output_lines.push(cleaned.to_string());
             }
         };
@@ -1061,6 +1190,11 @@ impl RlmKernelProcess {
                 if cleaned.trim().is_empty() {
                     continue;
                 }
+                if stderr_captured_chars + cleaned.len() > MAX_CAPTURED_CHARS {
+                    err_dropped += 1;
+                    continue;
+                }
+                stderr_captured_chars += cleaned.len();
                 stderr_lines.push(cleaned.to_string());
             }
         };
@@ -1097,6 +1231,19 @@ impl RlmKernelProcess {
         };
         let _ = std::fs::remove_file(file_path);
         result?;
+
+        if out_dropped > 0 {
+            output_lines.push(format!(
+                "...[{} more output line(s) truncated by the capture cap]",
+                out_dropped
+            ));
+        }
+        if err_dropped > 0 {
+            stderr_lines.push(format!(
+                "...[{} more stderr line(s) truncated by the capture cap]",
+                err_dropped
+            ));
+        }
 
         let mut output = output_lines.join("\n");
         if !stderr_lines.is_empty() {
@@ -1529,7 +1676,12 @@ impl Tool for RlmPythonTool {
         let timeout_secs = params
             .get("timeout_seconds")
             .and_then(|v| v.as_u64())
-            .unwrap_or(30);
+            .unwrap_or(30)
+            // Model-controlled value: an unbounded timeout would hold the
+            // GLOBAL kernel mutex for the whole duration, starving prewarm,
+            // inventory_snapshot, reset_allowlist and any other rlm_python
+            // call. Clamp to a sane range instead.
+            .clamp(1, 120);
         let reset = params.get("reset").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let mgr = get_rlm_manager();
@@ -1586,7 +1738,7 @@ impl Tool for RlmPythonTool {
         // process is killed and the kernel is reset for the next call.
         let exec_result = tokio::select! {
             biased;
-            _ = ctx.cancel.notified() => None,
+            _ = ctx.cancel.cancelled() => None,
             res = proc.execute_user_code(code, timeout_secs) => Some(res),
         };
         let exec_result = match exec_result {

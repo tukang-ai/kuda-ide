@@ -221,6 +221,17 @@ impl LlmProvider for OpenAiProvider {
                                     }
                                 }
                             }
+                        } else if !ev.data.trim().is_empty() {
+                            // A malformed/truncated frame means streamed content
+                            // (possibly a tool-call argument delta) was LOST.
+                            // Silently dropping it used to corrupt the assembled
+                            // arguments_json, which then failed to parse far away
+                            // from the root cause. Fail loudly so the retry
+                            // machinery can replay the request instead.
+                            out.push(Err(AppError::General(format!(
+                                "[origin-parse] Upstream sent a non-JSON SSE frame ({} bytes) — stream content may be incomplete",
+                                ev.data.len()
+                            ))));
                         }
                     }
                     Err(e) => {

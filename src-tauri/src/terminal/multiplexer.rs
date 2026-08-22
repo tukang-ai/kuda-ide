@@ -34,21 +34,28 @@ impl TerminalMultiplexer {
         Ok(session_id)
     }
 
-    pub fn write_to_session(&self, session_id: &str, data: &str) -> Result<()> {
-        let sessions = self.sessions.lock().unwrap();
-        let session = sessions
+    /// Clones the session handle out of the map WITHOUT holding the lock
+    /// during blocking PTY I/O. A stuck shell (Ctrl-S/XOFF flow control, a
+    /// stopped process group, a full PTY buffer) blocks `write_all` /
+    /// `kill().wait()` indefinitely; holding the sessions mutex through that
+    /// deadlocked EVERY terminal operation (spawn, kill, list, other tabs).
+    fn get_cloned(&self, session_id: &str) -> Result<PtySession> {
+        self.sessions
+            .lock()
+            .unwrap()
             .get(session_id)
-            .ok_or_else(|| AppError::General(format!("Session {} not found", session_id)))?;
+            .cloned()
+            .ok_or_else(|| AppError::General(format!("Session {} not found", session_id)))
+    }
 
+    pub fn write_to_session(&self, session_id: &str, data: &str) -> Result<()> {
+        let session = self.get_cloned(session_id)?;
+        // Map lock already released; only this session's writer is contended.
         session.write_bytes(data.as_bytes())
     }
 
     pub fn resize_session(&self, session_id: &str, cols: u16, rows: u16) -> Result<()> {
-        let sessions = self.sessions.lock().unwrap();
-        let session = sessions
-            .get(session_id)
-            .ok_or_else(|| AppError::General(format!("Session {} not found", session_id)))?;
-
+        let session = self.get_cloned(session_id)?;
         session.resize(cols, rows)
     }
 
@@ -56,8 +63,10 @@ impl TerminalMultiplexer {
     /// Unlike the old implementation (which only dropped the map entry and left
     /// the shell running), this reliably kills and reaps the child process.
     pub fn kill_session(&self, session_id: &str) -> Result<()> {
-        let mut sessions = self.sessions.lock().unwrap();
-        if let Some(session) = sessions.remove(session_id) {
+        // Remove under the lock, then kill+reap AFTER releasing it: `wait()`
+        // blocks until the child exits.
+        let removed = self.sessions.lock().unwrap().remove(session_id);
+        if let Some(session) = removed {
             let _ = session.kill();
             tracing::info!("Killed terminal session: {}", session_id);
             Ok(())
@@ -91,8 +100,10 @@ impl TerminalMultiplexer {
     /// Kills every live session (used when the terminal panel is closed so no
     /// shell process outlives the UI).
     pub fn kill_all(&self) {
-        let mut sessions = self.sessions.lock().unwrap();
-        for (id, session) in sessions.drain() {
+        // Drain under the lock, then kill+reap AFTER releasing it.
+        let drained: Vec<(String, PtySession)> =
+            self.sessions.lock().unwrap().drain().collect();
+        for (id, session) in drained {
             let _ = session.kill();
             tracing::info!("Killed terminal session on panel close: {}", id);
         }

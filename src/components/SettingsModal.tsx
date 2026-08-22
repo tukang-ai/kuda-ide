@@ -52,6 +52,109 @@ const toModels = (drafts: ProviderDraft[]): ipc.ProviderInfo[] =>
       has_key: true,
     }));
 
+/// Shared data the model-select fields render against. Passed as a plain prop
+/// bundle so ModelField/RoleRow can live at MODULE scope.
+interface ModelFieldCtx {
+  providerOptions: ipc.ProviderInfo[];
+  hubModels: ipc.HubModel[];
+  hubRecommendations: Record<string, string>;
+}
+
+/// Module-scope (NOT inline in SettingsModal): components defined inside a
+/// function body get a NEW component identity on every parent render, so React
+/// unmounted/remounted the whole subtree — inputs lost focus after every
+/// keystroke typed into a model name field.
+const ModelField: React.FC<{
+  value: ipc.ModelRef;
+  onChange: (patch: Partial<ipc.ModelRef>) => void;
+  uid: string;
+  roleKey?: string;
+  ctx: ModelFieldCtx;
+}> = ({ value, onChange, uid, roleKey, ctx }) => {
+  const provider = ctx.providerOptions.find((p) => p.id === value.provider_id);
+  const datalistId = `dl-${uid}`;
+  // Untuk provider Kuda Hub, pilihan model diambil dari list model API hub dan
+  // ditampilkan sebagai dropdown (bukan text) — varian sejenis punya harga point
+  // berbeda, dan yang direkomendasikan ditandai "(Recommended)".
+  const isHub = value.provider_id === 'kuda_hub' && ctx.hubModels.length > 0;
+  const hubOptions = isHub && roleKey ? ctx.hubModels.filter((m) => m.role === roleKey) : [];
+  const hubRecommended = roleKey ? ctx.hubRecommendations[roleKey] : undefined;
+  const missingOption: any[] =
+    value.model && !hubOptions.some((m) => m.id === value.model)
+      ? [{ id: value.model, name: value.model, input_price_per_1k: null, output_price_per_1k: null }]
+      : [];
+  return (
+    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+      <select
+        className="key-input"
+        value={value.provider_id}
+        onChange={(e) => onChange({ provider_id: e.target.value, model: '' })}
+        style={{ flex: 1, appearance: 'auto' }}
+      >
+        <option value="">Select provider…</option>
+        {ctx.providerOptions.map((p) => (
+          <option key={p.id} value={p.id}>
+            {p.name}
+          </option>
+        ))}
+      </select>
+      {isHub && roleKey ? (
+        <select
+          className="key-input"
+          value={value.model}
+          onChange={(e) => onChange({ model: e.target.value })}
+          style={{ flex: 1, appearance: 'auto' }}
+        >
+          <option value="">Select model…</option>
+          {[...missingOption, ...hubOptions].map((m: any) => (
+            <option key={m.id} value={m.id}>
+              {m.name} —{' '}
+              {m.input_price_per_1k != null
+                ? `${m.input_price_per_1k}/${m.output_price_per_1k} pts/1k (in/out) · cache ${m.input_price_cache_per_1k}`
+                : 'custom'}
+              {m.id === hubRecommended ? ' (Recommended)' : ''}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <>
+          <input
+            className="key-input"
+            list={datalistId}
+            value={value.model}
+            onChange={(e) => onChange({ model: e.target.value })}
+            placeholder={provider?.models[0] ? provider.models[0] : 'Model…'}
+            style={{ flex: 1 }}
+          />
+          <datalist id={datalistId}>
+            {(provider?.models ?? []).map((m) => (
+              <option key={m} value={m} />
+            ))}
+          </datalist>
+        </>
+      )}
+    </div>
+  );
+};
+
+const RoleRow: React.FC<{
+  title: string;
+  hint: string;
+  value: ipc.ModelRef;
+  onChange: (patch: Partial<ipc.ModelRef>) => void;
+  uid: string;
+  roleKey: string;
+  ctx: ModelFieldCtx;
+}> = ({ title, hint, value, onChange, uid, roleKey, ctx }) => (
+  <div style={{ marginBottom: 10 }}>
+    <div style={{ fontSize: 12, fontWeight: 700, color: '#fff', marginBottom: 6 }}>
+      {title}
+      <span style={{ fontWeight: 400, color: 'var(--text-secondary)', marginLeft: 6, fontSize: 11 }}>{hint}</span>
+    </div>
+    <ModelField value={value} onChange={onChange} uid={uid} roleKey={roleKey} ctx={ctx} />
+  </div>
+);
+
 /// Interactive tag / chip input for a comma-separated model list. Type a model
 /// name and press Enter (or ,) to add it as a removable chip; Backspace on an
 /// empty field removes the last chip. The value stays a plain comma-separated
@@ -111,10 +214,10 @@ export const SettingsModal: React.FC = () => {
   const checkKey = useAgent((s) => s.checkKey);
 
   const [tab, setTab] = useState<'providers' | 'agent' | 'subscription'>('providers');
-  const [selectedPlan, setSelectedPlan] = useState<'free' | 'pro' | 'developer'>('free');
   const [hubToken, setHubToken] = useState('');
   const [signingIn, setSigningIn] = useState(false);
   const [userUsage, setUserUsage] = useState<{
+    user_id?: string;
     plan_tier: string;
     tokens_today: number;
     tokens_remaining_today: number;
@@ -148,6 +251,7 @@ export const SettingsModal: React.FC = () => {
     executor_reviewer: { provider_id: '', model: '' },
     rlm_model: { provider_id: '', model: '' },
     rlm_verifier: { provider_id: '', model: '' },
+    chat_coordinator: { provider_id: '', model: '' },
   });
   const [saving, setSaving] = useState(false);
   const [note, setNote] = useState<string | null>(null);
@@ -192,7 +296,6 @@ export const SettingsModal: React.FC = () => {
         const usageData = await ipc.agentHubUserUsage();
         if (usageData && !usageData.error) {
           setUserUsage(usageData);
-          if (usageData.plan_tier) setSelectedPlan(usageData.plan_tier.toLowerCase() as any);
           return;
         }
       } catch {
@@ -206,7 +309,6 @@ export const SettingsModal: React.FC = () => {
       if (res.ok) {
         const data = await res.json();
         setUserUsage(data);
-        if (data.plan_tier) setSelectedPlan(data.plan_tier.toLowerCase() as any);
       }
     } catch {
       /* offline */
@@ -274,31 +376,7 @@ export const SettingsModal: React.FC = () => {
     }
   };
 
-  const switchPlanTier = async (newPlan: string) => {
-    try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (hubToken) headers['Authorization'] = `Bearer ${hubToken}`;
-      const res = await fetchWithTimeout(
-        `${ipc.HUB_BASE_URL}/api/v1/user/plan`,
-        {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ plan_tier: newPlan }),
-        },
-        6000,
-      );
-      if (res.ok) {
-        setSelectedPlan(newPlan.toLowerCase() as any);
-        setNote(`Successfully subscribed to ${newPlan.toUpperCase()} plan!`);
-        await fetchUsage();
-      } else {
-        const err = await res.json();
-        setNote(`Failed to update plan: ${err.error || 'Server error'}`);
-      }
-    } catch (e) {
-      setNote(`Server unreachable: ${e}`);
-    }
-  };
+
 
   const signInWithGithub = async () => {
     setSigningIn(true);
@@ -498,6 +576,11 @@ export const SettingsModal: React.FC = () => {
         executor_reviewer: agent.executor_reviewer,
         rlm_model: agent.rlm_model,
         rlm_verifier: agent.rlm_verifier,
+        chat_coordinator: agent.chat_coordinator || { provider_id: '', model: '' },
+        // Preserve the Plan Approval Gate toggle: omitting this field lets
+        // the backend serde default (true) silently re-enable a gate the
+        // user explicitly turned off.
+        plan_gate_enabled: agent.plan_gate_enabled ?? true,
       };
       if (clean.reviewers.length === 0) {
         clean.reviewers = [{ provider_id: '', model: '' }];
@@ -532,94 +615,7 @@ export const SettingsModal: React.FC = () => {
   };
 
   const providerOptions = toModels(providers);
-
-  const ModelField: React.FC<{
-    value: ipc.ModelRef;
-    onChange: (patch: Partial<ipc.ModelRef>) => void;
-    uid: string;
-    roleKey?: string;
-  }> = ({ value, onChange, uid, roleKey }) => {
-    const provider = providerOptions.find((p) => p.id === value.provider_id);
-    const datalistId = `dl-${uid}`;
-    // Untuk provider Kuda Hub, pilihan model diambil dari list model API hub dan
-    // ditampilkan sebagai dropdown (bukan text) — varian sejenis punya harga point
-    // berbeda, dan yang direkomendasikan ditandai "(Recommended)".
-    const isHub = value.provider_id === 'kuda_hub' && hubModels.length > 0;
-    const hubOptions = isHub && roleKey ? hubModels.filter((m) => m.role === roleKey) : [];
-    const hubRecommended = roleKey ? hubRecommendations[roleKey] : undefined;
-    const missingOption: any[] =
-      value.model && !hubOptions.some((m) => m.id === value.model)
-        ? [{ id: value.model, name: value.model, input_price_per_1k: null, output_price_per_1k: null }]
-        : [];    return (
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-        <select
-          className="key-input"
-          value={value.provider_id}
-          onChange={(e) => onChange({ provider_id: e.target.value, model: '' })}
-          style={{ flex: 1, appearance: 'auto' }}
-        >
-          <option value="">Select provider…</option>
-          {providerOptions.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name}
-            </option>
-          ))}
-        </select>
-        {isHub && roleKey ? (
-          <select
-            className="key-input"
-            value={value.model}
-            onChange={(e) => onChange({ model: e.target.value })}
-            style={{ flex: 1, appearance: 'auto' }}
-          >
-            <option value="">Select model…</option>
-            {[...missingOption, ...hubOptions].map((m: any) => (
-              <option key={m.id} value={m.id}>
-                {m.name} —{' '}
-                {m.input_price_per_1k != null
-                  ? `${m.input_price_per_1k}/${m.output_price_per_1k} pts/1k (in/out) · cache ${m.input_price_cache_per_1k}`
-                  : 'custom'}
-                {m.id === hubRecommended ? ' (Recommended)' : ''}
-              </option>
-            ))}
-          </select>
-        ) : (
-          <>
-            <input
-              className="key-input"
-              list={datalistId}
-              value={value.model}
-              onChange={(e) => onChange({ model: e.target.value })}
-              placeholder={provider?.models[0] ? provider.models[0] : 'Model…'}
-              style={{ flex: 1 }}
-            />
-            <datalist id={datalistId}>
-              {(provider?.models ?? []).map((m) => (
-                <option key={m} value={m} />
-              ))}
-            </datalist>
-          </>
-        )}
-      </div>
-    );
-  };
-
-  const RoleRow: React.FC<{
-    title: string;
-    hint: string;
-    value: ipc.ModelRef;
-    onChange: (patch: Partial<ipc.ModelRef>) => void;
-    uid: string;
-    roleKey: string;
-  }> = ({ title, hint, value, onChange, uid, roleKey }) => (
-    <div style={{ marginBottom: 10 }}>
-      <div style={{ fontSize: 12, fontWeight: 700, color: '#fff', marginBottom: 6 }}>
-        {title}
-        <span style={{ fontWeight: 400, color: 'var(--text-secondary)', marginLeft: 6, fontSize: 11 }}>{hint}</span>
-      </div>
-      <ModelField value={value} onChange={onChange} uid={uid} roleKey={roleKey} />
-    </div>
-  );
+  const modelCtx: ModelFieldCtx = { providerOptions, hubModels, hubRecommendations };
 
   const fieldStyle = {
     fontSize: 12,
@@ -754,21 +750,26 @@ export const SettingsModal: React.FC = () => {
               )}
 
               <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6, marginTop: 4 }}>
+                Chat Coordinator Mode (Agent-as-a-Tool Frontline)
+              </div>
+              <RoleRow title="Chat Coordinator" hint="frontline conversational coordinator" value={agent.chat_coordinator || { provider_id: '', model: '' }} onChange={(p) => setAgentRef('chat_coordinator', p)} uid="chat_coordinator" roleKey="chat_coordinator" ctx={modelCtx} />
+
+              <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6, marginTop: 12 }}>
                 RLM Phase (runs before Thinker)
               </div>
-              <RoleRow title="RLM Model" hint="collection + reasoning" value={agent.rlm_model} onChange={(p) => setAgentRef('rlm_model', p)} uid="rlm_model" roleKey="rlm_model" />
-              <RoleRow title="RLM Verifier" hint="completeness & safety check" value={agent.rlm_verifier} onChange={(p) => setAgentRef('rlm_verifier', p)} uid="rlm_verifier" roleKey="rlm_verifier" />
+              <RoleRow title="RLM Model" hint="collection + reasoning" value={agent.rlm_model} onChange={(p) => setAgentRef('rlm_model', p)} uid="rlm_model" roleKey="rlm_model" ctx={modelCtx} />
+              <RoleRow title="RLM Verifier" hint="completeness & safety check" value={agent.rlm_verifier} onChange={(p) => setAgentRef('rlm_verifier', p)} uid="rlm_verifier" roleKey="rlm_verifier" ctx={modelCtx} />
 
               <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6, marginTop: 12 }}>
                 Planning & Execution
               </div>
-              <RoleRow title="Thinker" hint="strategic direction & design" value={agent.thinker} onChange={(p) => setAgentRef('thinker', p)} uid="thinker" roleKey="thinker" />
-              <RoleRow title="Planning Writer" hint="drafts the full plan (cheap)" value={agent.planning_writer} onChange={(p) => setAgentRef('planning_writer', p)} uid="planning_writer" roleKey="planning_writer" />
-              <RoleRow title="Plan Reviewer" hint="reviews draft & evaluates audit" value={agent.plan_reviewer || { provider_id: '', model: '' }} onChange={(p) => setAgentRef('plan_reviewer', p)} uid="plan_reviewer" roleKey="plan_reviewer" />
-              <RoleRow title="Plan Editor" hint="surgically revises plan (cheap)" value={agent.plan_editor || { provider_id: '', model: '' }} onChange={(p) => setAgentRef('plan_editor', p)} uid="plan_editor" roleKey="plan_editor" />
-              <RoleRow title="Executor Code" hint="code edits" value={agent.executor_code} onChange={(p) => setAgentRef('executor_code', p)} uid="exec_code" roleKey="executor_code" />
-              <RoleRow title="Executor Design" hint="UI / CSS edits" value={agent.executor_design} onChange={(p) => setAgentRef('executor_design', p)} uid="exec_design" roleKey="executor_design" />
-              <RoleRow title="Executor Reviewer" hint="verifies applied changes" value={agent.executor_reviewer} onChange={(p) => setAgentRef('executor_reviewer', p)} uid="exec_reviewer" roleKey="executor_reviewer" />
+              <RoleRow title="Thinker" hint="strategic direction & design" value={agent.thinker} onChange={(p) => setAgentRef('thinker', p)} uid="thinker" roleKey="thinker" ctx={modelCtx} />
+              <RoleRow title="Planning Writer" hint="drafts the full plan (cheap)" value={agent.planning_writer} onChange={(p) => setAgentRef('planning_writer', p)} uid="planning_writer" roleKey="planning_writer" ctx={modelCtx} />
+              <RoleRow title="Plan Reviewer" hint="reviews draft & evaluates audit" value={agent.plan_reviewer || { provider_id: '', model: '' }} onChange={(p) => setAgentRef('plan_reviewer', p)} uid="plan_reviewer" roleKey="plan_reviewer" ctx={modelCtx} />
+              <RoleRow title="Plan Editor" hint="surgically revises plan (cheap)" value={agent.plan_editor || { provider_id: '', model: '' }} onChange={(p) => setAgentRef('plan_editor', p)} uid="plan_editor" roleKey="plan_editor" ctx={modelCtx} />
+              <RoleRow title="Executor Code" hint="code edits" value={agent.executor_code} onChange={(p) => setAgentRef('executor_code', p)} uid="exec_code" roleKey="executor_code" ctx={modelCtx} />
+              <RoleRow title="Executor Design" hint="UI / CSS edits" value={agent.executor_design} onChange={(p) => setAgentRef('executor_design', p)} uid="exec_design" roleKey="executor_design" ctx={modelCtx} />
+              <RoleRow title="Executor Reviewer" hint="verifies applied changes" value={agent.executor_reviewer} onChange={(p) => setAgentRef('executor_reviewer', p)} uid="exec_reviewer" roleKey="executor_reviewer" ctx={modelCtx} />
 
               <div style={{ marginTop: 4 }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
@@ -792,7 +793,7 @@ export const SettingsModal: React.FC = () => {
                         </button>
                       )}
                     </div>
-                    <ModelField value={r} onChange={(p) => setReviewer(idx, p)} uid={`rev-${idx}`} roleKey="reviewer" />
+                    <ModelField value={r} onChange={(p) => setReviewer(idx, p)} uid={`rev-${idx}`} roleKey="reviewer" ctx={modelCtx} />
                   </div>
                 ))}
               </div>

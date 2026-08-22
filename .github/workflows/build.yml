@@ -5,11 +5,11 @@
 name: Build KudaIDE (multi-OS)
 
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
-  pull_request:
   workflow_dispatch:
+  # push:
+  #   branches: [main]
+  #   tags: ["v*"]
+  # pull_request:
 
 concurrency:
   group: build-${{ github.ref }}

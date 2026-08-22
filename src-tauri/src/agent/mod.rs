@@ -1,4 +1,5 @@
 pub mod chat_history;
+pub mod chat_orchestrator;
 pub mod hub_session;
 pub mod key_store;
 pub mod llm_client;

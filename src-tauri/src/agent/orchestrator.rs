@@ -206,7 +206,7 @@ impl AgentOrchestrator {
             }
             let stream = tokio::select! {
                 biased;
-                _ = cancel.notified() => {
+                _ = cancel.cancelled() => {
                     return Err(AppError::General("Run cancelled by user.".to_string()));
                 }
                 r = provider.stream_complete(request.clone()) => r,
@@ -245,7 +245,7 @@ impl AgentOrchestrator {
                     // The backoff sleep is also cancellable.
                     tokio::select! {
                         biased;
-                        _ = cancel.notified() => {
+                        _ = cancel.cancelled() => {
                             return Err(AppError::General("Run cancelled by user.".to_string()));
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter)) => {}
@@ -263,11 +263,16 @@ impl AgentOrchestrator {
     async fn retry_after_empty_transient_stream(
         &self,
         err: &AppError,
-        _emitted_any: bool,
+        emitted_any: bool,
         restarts_left: &mut usize,
         cancel: &crate::agent::tool_registry::CancelFlag,
     ) -> Option<()> {
         if *restarts_left == 0
+            // HONOR the flag: once ANY text/tool-call delta reached the app,
+            // replaying the turn would re-execute side effects (duplicate file
+            // edits, duplicated UI text). Only a fully-empty attempt may be
+            // transparently restarted.
+            || emitted_any
             || !is_transient_llm_error(err)
             || cancel.is_cancelled()
         {
@@ -288,7 +293,7 @@ impl AgentOrchestrator {
         // instead of letting the run hang for the full backoff.
         tokio::select! {
             biased;
-            _ = cancel.notified() => return None,
+            _ = cancel.cancelled() => return None,
             _ = tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter)) => {}
         }
         Some(())
@@ -336,6 +341,10 @@ impl AgentOrchestrator {
                         | "submit_brief"
                         | "submit_review_directions"
                         | "request_rlm_research"
+                        | "call_rlm_research"
+                        | "call_thinker_direction"
+                        | "call_planning_swarm"
+                        | "call_executor"
                 )
             })
             .map(|d| ToolSchema {
@@ -472,7 +481,7 @@ impl AgentOrchestrator {
                                     }
                                 }
                             }
-                            _ = tool_ctx.cancel.notified() => {}
+                            _ = tool_ctx.cancel.cancelled() => {}
                         }
                     }
 
@@ -595,6 +604,8 @@ pub struct RoleLoopOutcome {
     pub history: Vec<Message>,
     /// Text of the final assistant message when the loop ended without tool calls.
     pub final_text: String,
+    /// Name of the stop tool invoked by the model when the loop stopped on a tool.
+    pub stop_tool_name: Option<String>,
     /// arguments_json of the stop tool (e.g. submit_plan / submit_verdict) when
     /// the model invoked it; None otherwise.
     pub stop_tool_args: Option<String>,
@@ -625,8 +636,9 @@ pub struct RoleLoopParams<'a> {
     pub max_turns: usize,
     pub temperature: f32,
     /// Name of the tool whose invocation concludes the loop (submit_plan /
-    /// submit_audit / submit_verdict / submit_brief). None for roles that end
-    /// with a plain text answer.
+    /// submit_audit / submit_verdict / submit_brief). Can be pipe-separated
+    /// (e.g. "tool_a|tool_b") to intercept any matching tool. None for roles
+    /// that end with a plain text answer.
     pub stop_on_tool: Option<&'a str>,
     /// Display key of the role running the loop (used in error messages).
     pub role_name: &'a str,
@@ -776,7 +788,7 @@ impl AgentOrchestrator {
                                     }
                                 }
                             }
-                            _ = tool_ctx.cancel.notified() => {}
+                            _ = tool_ctx.cancel.cancelled() => {}
                         }
                     }
 
@@ -809,10 +821,13 @@ impl AgentOrchestrator {
                 return Err(AppError::General("Run cancelled by user.".to_string()));
             }
 
-            // Intercept structured-handoff tool before anything else.
-            let stop_call = params
-                .stop_on_tool
-                .and_then(|stop_name| tool_calls.iter().find(|c| c.tool_name == stop_name).cloned());
+            // Intercept structured-handoff tool before anything else. Supports pipe-separated names.
+            let stop_call = params.stop_on_tool.and_then(|stop_spec| {
+                tool_calls
+                    .iter()
+                    .find(|c| stop_spec.split('|').any(|s| s.trim() == c.tool_name.as_str()))
+                    .cloned()
+            });
 
             if let Some(stop) = stop_call {
                 let mut assistant_message = Message::assistant(text_buffer.clone());
@@ -837,6 +852,7 @@ impl AgentOrchestrator {
                 return Ok(RoleLoopOutcome {
                     history,
                     final_text: last_text,
+                    stop_tool_name: Some(stop.tool_name),
                     stop_tool_args: Some(stop.arguments_json),
                     tokens_in: input_tokens,
                     tokens_out: output_tokens,
@@ -848,16 +864,29 @@ impl AgentOrchestrator {
 
             let mut tool_calls = tool_calls;
             if tool_calls.is_empty() {
-                // If model opened a tool tag but stream got cut off before closing it, trigger auto-retry!
-                for tool_name in params.allowed_tools {
-                    let open_tag = format!("<{}", tool_name);
-                    let close_tag = format!("</{}>", tool_name);
-                    if text_buffer.contains(&open_tag) && !text_buffer.contains(&close_tag) {
-                        return Err(AppError::General(format!(
-                            "[origin-close] Output terpotong di tengah stream: tag XML <{}> belum tertutup </{}>. Melakukan retry otomatis...",
-                            tool_name, tool_name
-                        )));
+                // Detect an UNCLOSED tool tag (stream cut off mid-call). The
+                // old code returned an Err promising "Melakukan retry
+                // otomatis..." that NOTHING ever performed — it propagated up
+                // and killed the whole phase/run. Self-correct inside this
+                // loop instead: ask the model to re-emit the complete call
+                // (still bounded by max_turns).
+                let truncated_tag = params.allowed_tools.iter().find(|tool_name| {
+                    text_buffer.contains(&format!("<{}", tool_name))
+                        && !text_buffer.contains(&format!("</{}>", tool_name))
+                });
+                if let Some(tool_name) = truncated_tag {
+                    let mut cut_msg = Message::assistant(text_buffer.clone());
+                    if !reasoning_buffer.is_empty() {
+                        cut_msg.reasoning_content = Some(reasoning_buffer.clone());
                     }
+                    history.push(cut_msg);
+                    history.push(Message::user(format!(
+                        "[TRUNCATED OUTPUT]: Your previous response was cut off in the middle of \
+                         a <{0}> call — no closing </{0}> tag was received, so it was discarded. \
+                         Re-emit the COMPLETE <{0}>...</{0}> call now.",
+                        tool_name
+                    )));
+                    continue;
                 }
                 tool_calls = extract_text_tool_calls(&text_buffer, params.allowed_tools);
             }
@@ -873,6 +902,7 @@ impl AgentOrchestrator {
                 return Ok(RoleLoopOutcome {
                     history,
                     final_text: last_text,
+                    stop_tool_name: None,
                     stop_tool_args: None,
                     tokens_in: input_tokens,
                     tokens_out: output_tokens,
@@ -933,6 +963,7 @@ impl AgentOrchestrator {
         Ok(RoleLoopOutcome {
             history,
             final_text: last_text,
+            stop_tool_name: None,
             stop_tool_args: None,
             tokens_in: input_tokens,
             tokens_out: output_tokens,
@@ -1087,6 +1118,13 @@ fn truncate_output(output: &str, max: usize) -> String {
     }
 }
 
+/// Tools whose arguments DIRECTLY mutate user-visible state. For these a
+/// "repaired" truncated JSON is not a convenience but a hazard: closing a
+/// stream-cut string mid-content means writing HALF A FILE or running HALF A
+/// COMMAND as if it were complete. Truncation repair stays available for
+/// read-only tools where a best-effort parse is harmless.
+const MUTATING_TOOLS: &[&str] = &["write_file", "multi_replace_file", "run_command"];
+
 /// Parses a tool call's `arguments_json`. Returns `None` when the JSON is
 /// malformed (e.g. concatenated objects from a sloppy model) so the caller can
 /// split it or report a precise, self-correcting error instead of silently
@@ -1096,6 +1134,11 @@ fn parse_tool_args(
 ) -> Option<serde_json::Value> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&call.arguments_json) {
         return Some(v);
+    }
+    // Never guess-and-close truncated JSON for mutating tools: the repair
+    // would execute partial content as if it were complete.
+    if MUTATING_TOOLS.iter().any(|t| *t == call.tool_name) {
+        return None;
     }
     // Attempt resilient repair for truncated/unclosed JSON strings
     repair_truncated_json(&call.arguments_json)

@@ -59,10 +59,12 @@ export const fsCreateDir = (path: string): Promise<void> =>
 export const fsRename = (from: string, to: string): Promise<string> =>
   invoke<string>('fs_rename', { from, to });
 
+// Matches Rust's externally-tagged enum `FsEvent` (one PathBuf per variant,
+// serialized as `{ "Modified": "/single/path" }`).
 export type FsEvent =
-  | { Created: string[] }
-  | { Modified: string[] }
-  | { Deleted: string[] };
+  | { Created: string }
+  | { Modified: string }
+  | { Deleted: string };
 
 export const fsWatchStart = (onEvent: Channel<FsEvent>): Promise<void> =>
   invoke<void>('fs_watch_start', { onEvent });
@@ -130,6 +132,15 @@ export const agentSwarmChat = (
   runId: string,
 ): Promise<AgentRunResult> =>
   invoke<AgentRunResult>('agent_swarm_chat', { userPrompt, sessionId, autoApprove, onEvent, runId });
+
+export const agentCoordinatorChat = (
+  userPrompt: string,
+  sessionId: string | null,
+  autoApprove: boolean,
+  onEvent: AgentEventChannel,
+  runId: string,
+): Promise<AgentRunResult> =>
+  invoke<AgentRunResult>('agent_coordinator_chat', { userPrompt, sessionId, autoApprove, onEvent, runId });
 
 export const agentResumeRun = (
   sessionId: string,
@@ -287,6 +298,7 @@ export interface AgentConfig {
   executor_reviewer: ModelRef;
   rlm_model: ModelRef;
   rlm_verifier: ModelRef;
+  chat_coordinator?: ModelRef;
   plan_gate_enabled?: boolean;
 }
 

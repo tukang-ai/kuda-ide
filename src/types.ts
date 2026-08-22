@@ -67,6 +67,9 @@ export interface ChatMessage {
   content: string;
   name?: string | null;
   tool_calls?: ToolCallChunk[] | null;
+  tool_call_id?: string | null;
+  reasoning_content?: string | null;
+  created_at?: string | null;
 }
 
 export interface ToolCallChunk {
@@ -135,7 +138,8 @@ export type AgentRoleKey =
   | 'executor_design'
   | 'executor_reviewer'
   | 'rlm_model'
-  | 'rlm_verifier';
+  | 'rlm_verifier'
+  | 'chat_coordinator';
 
 export type AgentEvent =
   | { kind: { ThoughtDelta: string } }

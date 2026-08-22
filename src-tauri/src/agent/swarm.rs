@@ -1301,7 +1301,7 @@ impl SwarmOrchestrator {
                     // to "lanjut" (this was inconsistent with the plan gate).
                     Err(_) => ("cancelled".to_string(), None),
                 },
-                _ = tool_ctx.cancel.notified() => ("cancelled".to_string(), None),
+                _ = tool_ctx.cancel.cancelled() => ("cancelled".to_string(), None),
             };
             // The `resolve` path already removed the entry; this drops it on the
             // cancel/timeout path so a stale sender can never be resolved later.
@@ -1395,10 +1395,27 @@ impl SwarmOrchestrator {
                     );
                     continue 'direction_review;
                 }
-                _ => {
-                    // "lanjut" (approve) or any unknown decision: proceed with the
-                    // (possibly empty) note folded into the full-plan instruction.
+                "lanjut" => {
+                    // Approved direction: proceed with the (possibly empty)
+                    // note folded into the full-plan instruction.
                     direction_note = decision.1;
+                }
+                other => {
+                    // FAIL CLOSED (consistent with the phase contract and the
+                    // plan gate): only explicit approvals may pass this human
+                    // checkpoint. An unrecognized decision string means
+                    // frontend/backend drift — auto-approving it would
+                    // silently bypass the gate.
+                    tracing::warn!(
+                        "Unknown direction decision {:?} — failing closed",
+                        other
+                    );
+                    ledger.plan_status = Some("CANCELLED AT DIRECTION".to_string());
+                    return Err(AppError::General(format!(
+                        "Direction gate: unrecognized decision '{}' — run stopped instead of \
+                         auto-approving.",
+                        other
+                    )));
                 }
             }
         }
@@ -1796,7 +1813,7 @@ impl SwarmOrchestrator {
                         Ok(d) => d,
                         Err(_) => ("cancelled".to_string(), None),
                     },
-                    _ = tool_ctx.cancel.notified() => ("cancelled".to_string(), None),
+                    _ = tool_ctx.cancel.cancelled() => ("cancelled".to_string(), None),
                 };
                 // Drop the stale registry entry on the cancel/timeout path.
                 tool_ctx.plan_decisions.remove(&request_id);
@@ -2053,16 +2070,29 @@ impl SwarmOrchestrator {
 
                 // Executor gets the full Thinker context cache (including Thinker reasoning)
                 // + approved plan & shared task progress.
-                let exec_start = shared.len();
+                //
+                // Content-based merge: `shared` is NOT a suffix-extension of
+                // `thinker_history` (the Thinker accumulates PRIVATE turns), so
+                // the old index arithmetic (`skip(thinker_history.len())` +
+                // `exec_start = shared.len()`) dropped early [PLAN]/summary
+                // messages from the executor's input AND mis-sliced the log
+                // window — pulling stale Thinker turns into executor_logs and
+                // cutting real executor turns. Deduplicating by value keeps
+                // every distinct message exactly once, in stable order.
                 let mut exec_history = if !thinker_history.is_empty() {
                     let mut h = thinker_history.clone();
-                    for msg in shared.iter().skip(thinker_history.len().min(shared.len())) {
-                        h.push(msg.clone());
+                    for msg in shared.iter() {
+                        if !h.contains(msg) {
+                            h.push(msg.clone());
+                        }
                     }
                     h
                 } else {
                     shared.clone()
                 };
+                // Baseline for the reviewer log window: everything from here on
+                // (task brief + executor turns) is executor-owned output.
+                let exec_start = exec_history.len();
                 exec_history.push(Message::user(build_executor_brief(&project_root, &approved_plan, task)));
 
                 // Snapshot the WHOLE project tree BEFORE execution so the diff
@@ -2797,6 +2827,912 @@ impl SwarmOrchestrator {
         }
         Ok(final_plan)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_rlm_phase(
+        &self,
+        messages: &[Message],
+        tool_ctx: &ToolContext,
+        auto_approve: bool,
+        emit: &impl Fn(AgentEventKind),
+        total_tokens: &mut usize,
+        total_tokens_in: &mut usize,
+        total_tokens_out: &mut usize,
+        total_cached_in: &mut usize,
+        ledger: &mut TurnLedger,
+        shared: &mut Vec<Message>,
+        run_id: &str,
+    ) -> Result<String> {
+        let project_root = tool_ctx.project_root.clone();
+        let app_data_dir = tool_ctx.app_data_dir.clone();
+        let mut rlm_ctx: Vec<Message> = messages.to_vec();
+        let mut brief_text: Option<String> = None;
+
+        let cache_store = rlm_cache::RlmCacheStore::new(&app_data_dir);
+        let cached = cache_store.load(&project_root);
+        let current_manifest = match rlm_cache::build_manifest(
+            &project_root,
+            cached.as_ref().and_then(|c| c.manifest.as_ref()),
+        ) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::warn!("RLM manifest build failed; treating cache as fresh: {}", e);
+                None
+            }
+        };
+        let manifest_diff =
+            match (cached.as_ref().and_then(|c| c.manifest.as_ref()), current_manifest.as_ref()) {
+                (Some(old), Some(new)) => Some(rlm_cache::diff_manifest(old, new)),
+                _ => None,
+            };
+        let cache_decision = rlm_cache::classify_cache_state(
+            &project_root,
+            cached.as_ref(),
+            manifest_diff.as_ref(),
+            CHANGED_RATIO_THRESHOLD,
+            chrono::Duration::days(MAX_BRIEF_AGE_DAYS),
+        );
+
+        match &cache_decision {
+            CacheDecision::Sufficiency => prewarm_cache(&cached, &manifest_diff, &project_root).await,
+            CacheDecision::Incremental => prewarm_cache(&cached, &manifest_diff, &project_root).await,
+            CacheDecision::Fresh => {}
+        }
+
+        let user_query = messages
+            .last()
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let mut final_brief: Option<ResearchBrief> = None;
+        let mut final_audit: Option<ContextAudit> = None;
+        let mut prev_audit: Option<ContextAudit> = None;
+
+        for rlm_round in 0..MAX_RLM_ROUNDS {
+            let is_first_round = rlm_round == 0;
+            let sufficiency_round = is_first_round
+                && matches!(&cache_decision, CacheDecision::Sufficiency);
+
+            if sufficiency_round {
+                if let (Some(b), Some(a)) = (cached.as_ref().and_then(|c| c.brief.as_ref()), cached.as_ref().and_then(|c| c.audit.as_ref())) {
+                    emit(AgentEventKind::PhaseStarted {
+                        role: AgentRole::RlmVerifier.key().to_string(),
+                        label: "RLM Verifier: evaluating cached research sufficiency".to_string(),
+                        model: "verifier".to_string(),
+                    });
+                    emit(AgentEventKind::PhaseCompleted {
+                        role: AgentRole::RlmVerifier.key().to_string(),
+                        summary: "Cached research is sufficient".to_string(),
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        cached_in: 0,
+                    });
+                    final_brief = Some(b.clone());
+                    final_audit = Some(a.clone());
+                    break;
+                }
+            }
+
+            let rlm_model_provider =
+                resolve_role_provider(AgentRole::RlmModel, &app_data_dir).await?;
+            let rlm_verifier_provider =
+                resolve_role_provider(AgentRole::RlmVerifier, &app_data_dir).await?;
+
+            emit(AgentEventKind::PhaseStarted {
+                role: AgentRole::RlmModel.key().to_string(),
+                label: format!(
+                    "RLM Model: research pass {}/{}",
+                    rlm_round + 1,
+                    MAX_RLM_ROUNDS
+                ),
+                model: rlm_model_provider.name().to_string(),
+            });
+
+            if !is_first_round {
+                if let Some(ref audit) = prev_audit {
+                    let missing_summary = audit
+                        .missing
+                        .iter()
+                        .map(|g| format!("- {} ({}): needed for {}", g.what, g.where_path, g.why_needed))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    rlm_ctx.push(Message::user(format!(
+                        "[RLM AUDIT GAPS — ROUND {}/{}]:\n{}\n\nResolve these missing gaps now.",
+                        rlm_round + 1,
+                        MAX_RLM_ROUNDS,
+                        missing_summary
+                    )));
+                }
+            }
+
+            let spec = AgentRole::RlmModel.spec();
+            let model_outcome = self
+                .inner
+                .run_role_loop(
+                    RoleLoopParams {
+                        system_prompt: PromptComposer::compose_role_prompt(
+                            AgentRole::RlmModel,
+                            &project_root,
+                        ),
+                        messages: rlm_ctx.clone(),
+                        allowed_tools: &spec.allowed_tools,
+                        provider: rlm_model_provider,
+                        max_turns: spec.max_turns,
+                        temperature: spec.temperature,
+                        stop_on_tool: Some("submit_brief"),
+                        role_name: AgentRole::RlmModel.key(),
+                    },
+                    tool_ctx,
+                    auto_approve,
+                    emit,
+                )
+                .await?;
+
+            *total_tokens += model_outcome.tokens_used;
+            *total_tokens_in += model_outcome.tokens_in;
+            *total_tokens_out += model_outcome.tokens_out;
+            *total_cached_in += model_outcome.cached_in;
+
+            let brief_doc = if let Some(ref args) = model_outcome.stop_tool_args {
+                handoff_doc(&project_root, args, &model_outcome.final_text)?
+            } else {
+                model_outcome.final_text.clone()
+            };
+
+            brief_text = Some(brief_doc.clone());
+
+            let parsed_brief = parse_brief_doc(&brief_doc).unwrap_or_else(|_| ResearchBrief {
+                summary: model_outcome.final_text.clone(),
+                key_files: vec![],
+                relevant_snippets: vec![],
+                conventions: String::new(),
+                risks_unknowns: vec![],
+                external_pulls: vec![],
+            });
+
+            emit(AgentEventKind::PhaseCompleted {
+                role: AgentRole::RlmModel.key().to_string(),
+                summary: format!("Brief drafted with {} key file(s)", parsed_brief.key_files.len()),
+                tokens_in: model_outcome.tokens_in,
+                tokens_out: model_outcome.tokens_out,
+                cached_in: model_outcome.cached_in,
+            });
+
+            emit(AgentEventKind::PhaseStarted {
+                role: AgentRole::RlmVerifier.key().to_string(),
+                label: "RLM Verifier: auditing research brief".to_string(),
+                model: rlm_verifier_provider.name().to_string(),
+            });
+
+            let verifier_spec = AgentRole::RlmVerifier.spec();
+            let audit_outcome = self
+                .inner
+                .run_role_loop(
+                    RoleLoopParams {
+                        system_prompt: PromptComposer::compose_role_prompt(
+                            AgentRole::RlmVerifier,
+                            &project_root,
+                        ),
+                        messages: vec![Message::user(format!(
+                            "[AUDIT RESEARCH BRIEF]\nQuery: {}\nBrief:\n{}",
+                            user_query, brief_doc
+                        ))],
+                        allowed_tools: &verifier_spec.allowed_tools,
+                        provider: rlm_verifier_provider,
+                        max_turns: verifier_spec.max_turns,
+                        temperature: verifier_spec.temperature,
+                        stop_on_tool: Some("submit_audit"),
+                        role_name: AgentRole::RlmVerifier.key(),
+                    },
+                    tool_ctx,
+                    auto_approve,
+                    emit,
+                )
+                .await?;
+
+            *total_tokens += audit_outcome.tokens_used;
+            *total_tokens_in += audit_outcome.tokens_in;
+            *total_tokens_out += audit_outcome.tokens_out;
+            *total_cached_in += audit_outcome.cached_in;
+
+            let audit_doc = if let Some(ref args) = audit_outcome.stop_tool_args {
+                handoff_doc(&project_root, args, &audit_outcome.final_text)?
+            } else {
+                audit_outcome.final_text.clone()
+            };
+
+            let parsed_audit = parse_audit_doc(&audit_doc).unwrap_or_else(|_| {
+                // FAIL-CLOSED (mirrors run_swarm's verifier fallbacks): an
+                // unparseable audit must NOT be treated as complete — the old
+                // `complete: true` default marked unverifiable research as
+                // done AND let it poison the persistent RLM research cache.
+                ContextAudit {
+                    complete: false,
+                    summary: "RLM Verifier submitted an unparseable audit; brief treated as \
+                              incomplete."
+                        .to_string(),
+                    missing: vec![AuditGap {
+                        what: "RLM Verifier failed to produce a valid audit".into(),
+                        where_path: String::new(),
+                        why_needed: "verification of research completeness".into(),
+                    }],
+                }
+            });
+
+            emit(AgentEventKind::PhaseCompleted {
+                role: AgentRole::RlmVerifier.key().to_string(),
+                summary: if parsed_audit.complete {
+                    "Audit PASSED — research is complete".to_string()
+                } else {
+                    format!("Audit found {} gap(s)", parsed_audit.missing.len())
+                },
+                tokens_in: audit_outcome.tokens_in,
+                tokens_out: audit_outcome.tokens_out,
+                cached_in: audit_outcome.cached_in,
+            });
+
+            final_brief = Some(parsed_brief);
+            let is_complete = parsed_audit.complete;
+            prev_audit = Some(parsed_audit.clone());
+            final_audit = Some(parsed_audit);
+
+            if is_complete {
+                break;
+            }
+        }
+
+        let brief_digest = brief_text.unwrap_or_else(|| {
+            "(No RLM brief produced — proceed with caution.)".to_string()
+        });
+        ledger.brief_digest = Some(truncate_chars(&brief_digest, LEDGER_BRIEF_CHARS));
+
+        shared.push(Message::user(format!(
+            "[RESEARCH BRIEF — validated by RLM]\n{}",
+            brief_digest
+        )));
+
+        if let (Some(b), Some(a)) = (final_brief.as_ref(), final_audit.as_ref()) {
+            if a.complete {
+                if let Some(manifest) = current_manifest.as_ref() {
+                    let inventory = get_rlm_manager().inventory_snapshot(&project_root).await;
+                    let _ = cache_store.save(&project_root, b, a, &brief_digest, manifest, &inventory);
+                }
+            }
+        }
+
+        write_checkpoint(
+            &app_data_dir,
+            run_id,
+            &RunCheckpoint {
+                phase: ResumePhase::Direction,
+                shared: shared.clone(),
+                total_tokens: *total_tokens,
+                tokens_in: *total_tokens_in,
+                tokens_out: *total_tokens_out,
+                cached_in: *total_cached_in,
+                ledger: ledger.clone(),
+                final_plan: None,
+                pending_tasks: Vec::new(),
+                executor_logs: Vec::new(),
+                fix_round: 0,
+                exec_notes: Vec::new(),
+            },
+        );
+
+        Ok(brief_digest)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_thinker_direction_phase(
+        &self,
+        tool_ctx: &ToolContext,
+        auto_approve: bool,
+        emit: &impl Fn(AgentEventKind),
+        gate_enabled: bool,
+        total_tokens: &mut usize,
+        total_tokens_in: &mut usize,
+        total_tokens_out: &mut usize,
+        total_cached_in: &mut usize,
+        ledger: &mut TurnLedger,
+        shared: &mut Vec<Message>,
+        thinker_history: &mut Vec<Message>,
+        run_id: &str,
+    ) -> Result<Option<String>> {
+        let project_root = tool_ctx.project_root.clone();
+        let app_data_dir = tool_ctx.app_data_dir.clone();
+
+        const MAX_DIRECTION_REVISIONS: usize = 2;
+        let mut direction_revisions = 0usize;
+        let mut direction_note: Option<String> = None;
+
+        'direction_review: loop {
+            let thinker_provider = resolve_role_provider(AgentRole::Thinker, &app_data_dir).await?;
+            emit(AgentEventKind::PhaseStarted {
+                role: AgentRole::Thinker.key().to_string(),
+                label: "Thinker: kesimpulan sementara".to_string(),
+                model: thinker_provider.name().to_string(),
+            });
+
+            let direction_prompt = format!(
+                "{}\n\nDIRECTION CHECKPOINT: Tulis KESIMPULAN SEMENTARA (~5-8 baris: goal, approach dalam 2-4 poin, file utama \
+                 yang akan disentuh, risiko/asumsi) sekarang. If the request needs NO file \
+                 changes, begin your conclusion with exactly: NO_FILE_CHANGES",
+                PromptComposer::compose_role_prompt(AgentRole::Thinker, &project_root)
+            );
+
+            let dir_history: Vec<Message> = shared.clone();
+            let dir_outcome = self
+                .inner
+                .run_role_loop(
+                    RoleLoopParams {
+                        system_prompt: direction_prompt.clone(),
+                        messages: dir_history.clone(),
+                        allowed_tools: &["request_rlm_research".to_string()],
+                        provider: thinker_provider.clone(),
+                        max_turns: 3,
+                        temperature: 0.2,
+                        stop_on_tool: Some("request_rlm_research"),
+                        role_name: "thinker (kesimpulan sementara)",
+                    },
+                    tool_ctx,
+                    auto_approve,
+                    emit,
+                )
+                .await?;
+
+            *total_tokens += dir_outcome.tokens_used;
+            *total_tokens_in += dir_outcome.tokens_in;
+            *total_tokens_out += dir_outcome.tokens_out;
+            *total_cached_in += dir_outcome.cached_in;
+
+            let conclusion = dir_outcome.final_text.clone();
+
+            emit(AgentEventKind::PhaseCompleted {
+                role: AgentRole::Thinker.key().to_string(),
+                summary: "Kesimpulan sementara selesai".to_string(),
+                tokens_in: dir_outcome.tokens_in,
+                tokens_out: dir_outcome.tokens_out,
+                cached_in: dir_outcome.cached_in,
+            });
+
+            if conclusion.trim().starts_with("NO_FILE_CHANGES") {
+                ledger.final_answer = truncate_chars(&conclusion, LEDGER_ANSWER_CHARS);
+                return Ok(None);
+            }
+
+            *thinker_history = dir_outcome.history.clone();
+            shared.push(Message::assistant(conclusion.clone()));
+
+            if gate_enabled {
+                let request_id = format!("direction_{}", uuid::Uuid::new_v4().simple());
+                let rx = tool_ctx.direction_decisions.register(&request_id);
+                emit(AgentEventKind::DirectionDecisionRequest {
+                    request_id: request_id.clone(),
+                    conclusion: conclusion.clone(),
+                });
+                let decision = tokio::select! {
+                    r = rx => match r {
+                        Ok(d) => d,
+                        Err(_) => ("cancelled".to_string(), None),
+                    },
+                    _ = tool_ctx.cancel.cancelled() => ("cancelled".to_string(), None),
+                };
+                tool_ctx.direction_decisions.remove(&request_id);
+                emit(AgentEventKind::DirectionDecisionResolved {
+                    request_id,
+                    decision: decision.0.clone(),
+                    note: decision.1.clone(),
+                });
+                if decision.0 == "ubah" {
+                    direction_revisions += 1;
+                    if direction_revisions >= MAX_DIRECTION_REVISIONS {
+                        return Err(AppError::General("Direction rejected too many times.".to_string()));
+                    }
+                    direction_note = decision.1;
+                    continue 'direction_review;
+                } else if decision.0 == "cancelled" {
+                    return Err(AppError::General("Direction cancelled by user.".to_string()));
+                } else if decision.0 != "lanjut" {
+                    // FAIL CLOSED: unrecognized decision (frontend/backend
+                    // drift) must not auto-approve the direction.
+                    return Err(AppError::General(format!(
+                        "Direction gate: unrecognized decision '{}' — run stopped instead of \
+                         auto-approving.",
+                        decision.0
+                    )));
+                }
+            }
+
+            write_checkpoint(
+                &app_data_dir,
+                run_id,
+                &RunCheckpoint {
+                    phase: ResumePhase::Planning,
+                    shared: shared.clone(),
+                    total_tokens: *total_tokens,
+                    tokens_in: *total_tokens_in,
+                    tokens_out: *total_tokens_out,
+                    cached_in: *total_cached_in,
+                    ledger: ledger.clone(),
+                    final_plan: None,
+                    pending_tasks: Vec::new(),
+                    executor_logs: Vec::new(),
+                    fix_round: 0,
+                    exec_notes: Vec::new(),
+                },
+            );
+
+            return Ok(Some(conclusion));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_planning_phase(
+        &self,
+        thinker_history: &[Message],
+        tool_ctx: &ToolContext,
+        auto_approve: bool,
+        emit: &impl Fn(AgentEventKind),
+        gate_enabled: bool,
+        total_tokens: &mut usize,
+        total_tokens_in: &mut usize,
+        total_tokens_out: &mut usize,
+        total_cached_in: &mut usize,
+        ledger: &mut TurnLedger,
+        shared: &mut Vec<Message>,
+        run_id: &str,
+    ) -> Result<SwarmPlan> {
+        let project_root = tool_ctx.project_root.clone();
+        let app_data_dir = tool_ctx.app_data_dir.clone();
+
+        let planning_writer_provider =
+            resolve_role_provider(AgentRole::PlanningWriter, &app_data_dir).await?;
+        let plan_reviewer_provider =
+            resolve_role_provider(AgentRole::PlanReviewer, &app_data_dir).await?;
+
+        emit(AgentEventKind::PhaseStarted {
+            role: AgentRole::PlanningWriter.key().to_string(),
+            label: "Planning Writer: drafting detailed plan".to_string(),
+            model: planning_writer_provider.name().to_string(),
+        });
+
+        let mut writer_ctx: Vec<Message> = if !thinker_history.is_empty() {
+            thinker_history.to_vec()
+        } else {
+            shared.clone()
+        };
+        let writer_spec = AgentRole::PlanningWriter.spec();
+        let mut draft_plan: Option<SwarmPlan> = None;
+        let mut last_revision_notes: Option<String> = None;
+
+        for review_round in 0..MAX_PLAN_GATE_ROUNDS {
+            let writer_outcome = self
+                .inner
+                .run_role_loop(
+                    RoleLoopParams {
+                        system_prompt: PromptComposer::compose_role_prompt(
+                            AgentRole::PlanningWriter,
+                            &project_root,
+                        ),
+                        messages: writer_ctx.clone(),
+                        allowed_tools: &writer_spec.allowed_tools,
+                        provider: planning_writer_provider.clone(),
+                        max_turns: writer_spec.max_turns,
+                        temperature: writer_spec.temperature,
+                        stop_on_tool: Some("submit_plan"),
+                        role_name: AgentRole::PlanningWriter.key(),
+                    },
+                    tool_ctx,
+                    auto_approve,
+                    emit,
+                )
+                .await?;
+
+            *total_tokens += writer_outcome.tokens_used;
+            *total_tokens_in += writer_outcome.tokens_in;
+            *total_tokens_out += writer_outcome.tokens_out;
+            *total_cached_in += writer_outcome.cached_in;
+
+            let plan_doc = if let Some(ref a) = writer_outcome.stop_tool_args {
+                handoff_doc(&project_root, a, &writer_outcome.final_text)?
+            } else {
+                writer_outcome.final_text.clone()
+            };
+
+            let parsed = match parse_plan_doc(&plan_doc) {
+                Ok(p) => p,
+                Err(e) => {
+                    // NEVER execute a fabricated placeholder task: the old
+                    // fallback built a dummy single-task "Execute task" plan
+                    // from an UNPARSEABLE draft, sending executors off to
+                    // invent work with no real instructions. Treat this round
+                    // as failed instead — request a valid re-draft (bounded by
+                    // MAX_PLAN_GATE_ROUNDS); if no valid plan ever lands, the
+                    // post-loop ok_or_else aborts the run.
+                    tracing::warn!("Planning Writer produced an unparseable plan: {}", e);
+                    emit(AgentEventKind::PhaseCompleted {
+                        role: AgentRole::PlanningWriter.key().to_string(),
+                        summary: format!(
+                            "Plan draft unparseable ({}) — requesting a valid re-draft",
+                            truncate_chars(&e.to_string(), 120)
+                        ),
+                        tokens_in: writer_outcome.tokens_in,
+                        tokens_out: writer_outcome.tokens_out,
+                        cached_in: writer_outcome.cached_in,
+                    });
+                    writer_ctx.push(Message::user(format!(
+                        "[INVALID PLAN SUBMISSION]: Your plan could not be parsed ({}). \
+                         Re-submit the COMPLETE plan via submit_plan in the exact required format.",
+                        truncate_chars(&e.to_string(), 200)
+                    )));
+                    continue;
+                }
+            };
+
+            draft_plan = Some(parsed.clone());
+
+            emit(AgentEventKind::PhaseCompleted {
+                role: AgentRole::PlanningWriter.key().to_string(),
+                summary: format!("Drafted plan with {} task(s)", parsed.tasks.len()),
+                tokens_in: writer_outcome.tokens_in,
+                tokens_out: writer_outcome.tokens_out,
+                cached_in: writer_outcome.cached_in,
+            });
+
+            emit(AgentEventKind::PhaseStarted {
+                role: AgentRole::PlanReviewer.key().to_string(),
+                label: "Plan Reviewer: validating plan".to_string(),
+                model: plan_reviewer_provider.name().to_string(),
+            });
+
+            let reviewer_spec = AgentRole::PlanReviewer.spec();
+            let reviewer_outcome = self
+                .inner
+                .run_role_loop(
+                    RoleLoopParams {
+                        system_prompt: PromptComposer::compose_role_prompt(
+                            AgentRole::PlanReviewer,
+                            &project_root,
+                        ),
+                        messages: vec![Message::user(format!(
+                            "[REVIEW PLAN DRAFT]\nDraft:\n{}",
+                            plan_doc
+                        ))],
+                        allowed_tools: &reviewer_spec.allowed_tools,
+                        provider: plan_reviewer_provider.clone(),
+                        max_turns: reviewer_spec.max_turns,
+                        temperature: reviewer_spec.temperature,
+                        stop_on_tool: Some("submit_plan_review"),
+                        role_name: AgentRole::PlanReviewer.key(),
+                    },
+                    tool_ctx,
+                    auto_approve,
+                    emit,
+                )
+                .await?;
+
+            *total_tokens += reviewer_outcome.tokens_used;
+            *total_tokens_in += reviewer_outcome.tokens_in;
+            *total_tokens_out += reviewer_outcome.tokens_out;
+            *total_cached_in += reviewer_outcome.cached_in;
+
+            let (approved, notes) = parse_plan_review(&reviewer_outcome.stop_tool_args);
+
+            emit(AgentEventKind::PhaseCompleted {
+                role: AgentRole::PlanReviewer.key().to_string(),
+                summary: if approved {
+                    "Plan APPROVED by Plan Reviewer".to_string()
+                } else {
+                    format!("Revision requested: {}", notes.as_deref().unwrap_or("needs improvements"))
+                },
+                tokens_in: reviewer_outcome.tokens_in,
+                tokens_out: reviewer_outcome.tokens_out,
+                cached_in: reviewer_outcome.cached_in,
+            });
+
+            if approved {
+                break;
+            }
+            last_revision_notes = notes;
+            if let Some(ref n) = last_revision_notes {
+                writer_ctx.push(Message::user(format!(
+                    "[REVISE PLAN]:\n{}\nRevise \".kuda/plan/plan.md\" now.",
+                    n
+                )));
+            }
+        }
+
+        let mut final_plan = draft_plan.ok_or_else(|| {
+            AppError::General("Planning Swarm failed to produce a valid plan.".to_string())
+        })?;
+
+        final_plan = self
+            .run_reviewer_improvement_loop(
+                shared,
+                &final_plan,
+                &project_root,
+                &app_data_dir,
+                tool_ctx,
+                auto_approve,
+                emit,
+                total_tokens,
+                total_tokens_in,
+                total_tokens_out,
+                total_cached_in,
+            )
+            .await?;
+
+        let (plan_path, _) = resolve_plan_path(&project_root);
+        let plan_md = render_plan_markdown(&final_plan);
+        if let Some(parent) = plan_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&plan_path, &plan_md);
+
+        ledger.plan_markdown = Some(truncate_chars(&plan_md, LEDGER_PLAN_CHARS));
+        ledger.plan_status = Some("approved".to_string());
+
+        shared.push(Message::user(format!("[APPROVED PLAN]\n{}", plan_md)));
+
+        Ok(final_plan)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_executor_phase(
+        &self,
+        approved_plan: &SwarmPlan,
+        resume: Option<&RunCheckpoint>,
+        resume_executing: bool,
+        tool_ctx: &ToolContext,
+        auto_approve: bool,
+        emit: &impl Fn(AgentEventKind),
+        total_tokens: &mut usize,
+        total_tokens_in: &mut usize,
+        total_tokens_out: &mut usize,
+        total_cached_in: &mut usize,
+        ledger: &mut TurnLedger,
+        shared: &mut Vec<Message>,
+        exec_notes: &mut Vec<String>,
+        run_id: &str,
+    ) -> Result<(Option<Verdict>, String)> {
+        let project_root = tool_ctx.project_root.clone();
+        let app_data_dir = tool_ctx.app_data_dir.clone();
+
+        let mut tasks: Vec<SwarmPlanTask> = if resume_executing {
+            resume.map(|r| r.pending_tasks.clone()).unwrap_or_default()
+        } else {
+            normalize_tasks(approved_plan.tasks.clone())
+        };
+
+        let mut fix_round: usize = 0;
+        let mut verdict_opt: Option<Verdict> = None;
+
+        loop {
+            for task in &tasks {
+                if tool_ctx.cancel.is_cancelled() {
+                    emit(AgentEventKind::Error("Execution cancelled by user.".to_string()));
+                    return Err(AppError::General("Execution cancelled by user.".to_string()));
+                }
+
+                let role = if task.kind.eq_ignore_ascii_case("design") {
+                    AgentRole::ExecutorDesign
+                } else {
+                    AgentRole::ExecutorCode
+                };
+
+                let executor_provider = resolve_role_provider(role, &app_data_dir).await?;
+                let spec = role.spec();
+
+                emit(AgentEventKind::PhaseStarted {
+                    role: role.key().to_string(),
+                    label: format!("{}: Task #{} - {}", role.display_name(), task.id, task.description),
+                    model: executor_provider.name().to_string(),
+                });
+
+                let before_tree = snapshot_project_tree(tool_ctx);
+
+                let task_ctx = vec![Message::user(format!(
+                    "[TASK EXECUTION]\n\
+                     Task #{} [{}]: {}\n\
+                     Files: {:?}\n\
+                     Context: {}\n\n\
+                     Apply surgical code modifications to accomplish this task.",
+                    task.id,
+                    task.kind,
+                    task.description,
+                    task.files,
+                    task.context.as_deref().unwrap_or("(none)")
+                ))];
+
+                let outcome = self
+                    .inner
+                    .run_role_loop(
+                        RoleLoopParams {
+                            system_prompt: PromptComposer::compose_role_prompt(role, &project_root),
+                            messages: task_ctx,
+                            allowed_tools: &spec.allowed_tools,
+                            provider: executor_provider,
+                            max_turns: spec.max_turns,
+                            temperature: spec.temperature,
+                            stop_on_tool: None,
+                            role_name: role.key(),
+                        },
+                        tool_ctx,
+                        auto_approve,
+                        emit,
+                    )
+                    .await?;
+
+                *total_tokens += outcome.tokens_used;
+                *total_tokens_in += outcome.tokens_in;
+                *total_tokens_out += outcome.tokens_out;
+                *total_cached_in += outcome.cached_in;
+
+                let diff_report = build_tree_diff_report(tool_ctx, &before_tree);
+
+                emit(AgentEventKind::PhaseCompleted {
+                    role: role.key().to_string(),
+                    summary: format!("Task #{} executed", task.id),
+                    tokens_in: outcome.tokens_in,
+                    tokens_out: outcome.tokens_out,
+                    cached_in: outcome.cached_in,
+                });
+
+                exec_notes.push(format!("Task #{}: {}", task.id, outcome.final_text));
+            }
+
+            // Executor Reviewer Verification
+            let reviewer_provider =
+                resolve_role_provider(AgentRole::ExecutorReviewer, &app_data_dir).await?;
+            let rev_spec = AgentRole::ExecutorReviewer.spec();
+
+            emit(AgentEventKind::PhaseStarted {
+                role: AgentRole::ExecutorReviewer.key().to_string(),
+                label: "Executor Reviewer: verifying edits against tasks".to_string(),
+                model: reviewer_provider.name().to_string(),
+            });
+
+            let verify_ctx = vec![Message::user(format!(
+                "[VERIFICATION OF EXECUTOR EDITS]\n\
+                 Plan Goal: {}\n\
+                 Executor Reports: {:?}\n\n\
+                 Inspect the modifications, check for regressions, and submit verdict via submit_verdict.",
+                approved_plan.goal,
+                exec_notes
+            ))];
+
+            let rev_outcome = self
+                .inner
+                .run_role_loop(
+                    RoleLoopParams {
+                        system_prompt: PromptComposer::compose_role_prompt(
+                            AgentRole::ExecutorReviewer,
+                            &project_root,
+                        ),
+                        messages: verify_ctx,
+                        allowed_tools: &rev_spec.allowed_tools,
+                        provider: reviewer_provider,
+                        max_turns: 2,
+                        temperature: rev_spec.temperature,
+                        stop_on_tool: Some("submit_verdict"),
+                        role_name: AgentRole::ExecutorReviewer.key(),
+                    },
+                    tool_ctx,
+                    auto_approve,
+                    emit,
+                )
+                .await?;
+
+            *total_tokens += rev_outcome.tokens_used;
+            *total_tokens_in += rev_outcome.tokens_in;
+            *total_tokens_out += rev_outcome.tokens_out;
+            *total_cached_in += rev_outcome.cached_in;
+
+            // A missing or unparseable verdict means the results could NOT be
+            // confirmed. `parse_verdict_markdown` returns Ok with passed=false
+            // and an EMPTY issue list for prose answers without a heading —
+            // treating that as a real failure used to spawn a pointless fix
+            // round of ZERO tasks (re-running the identical review) and end
+            // the run as "Verification finished with issues: " (empty).
+            // Mirror run_swarm's confirmable handling instead: only a
+            // genuinely parsed verdict (passed, or failed with actionable
+            // issues) may drive a fix round; anything else ends as UNVERIFIED.
+            let parsed_verdict = match &rev_outcome.stop_tool_args {
+                Some(args) => handoff_doc(&project_root, args, &rev_outcome.final_text)
+                    .ok()
+                    .and_then(|doc| parse_verdict_doc(&doc).ok()),
+                None => None,
+            };
+            let confirmable = parsed_verdict
+                .as_ref()
+                .map(|v| v.passed || !v.issues.is_empty() || !v.summary.trim().is_empty())
+                .unwrap_or(false);
+            let (verdict, confirmable) = if confirmable {
+                (parsed_verdict.clone().unwrap(), true)
+            } else {
+                (
+                    Verdict {
+                        passed: false,
+                        summary: if rev_outcome.exhausted_turns {
+                            "Executor Reviewer hit its turn limit without submitting a verdict; \
+                             results could not be confirmed."
+                                .to_string()
+                        } else if rev_outcome.final_text.trim().is_empty() {
+                            "Executor Reviewer did not submit a verdict; results could not be \
+                             confirmed."
+                                .to_string()
+                        } else {
+                            format!(
+                                "Executor Reviewer did not submit a structured verdict; reviewer \
+                                 said: {}",
+                                truncate_chars(rev_outcome.final_text.trim(), 160)
+                            )
+                        },
+                        issues: vec![],
+                    },
+                    false,
+                )
+            };
+
+            let passed = verdict.passed;
+            verdict_opt = if confirmable { Some(verdict.clone()) } else { None };
+
+            emit(AgentEventKind::PhaseCompleted {
+                role: AgentRole::ExecutorReviewer.key().to_string(),
+                summary: if !confirmable {
+                    format!("UNVERIFIED — {}", truncate_chars(&verdict.summary, 200))
+                } else if passed {
+                    "Verification PASSED — changes accepted".to_string()
+                } else {
+                    format!("Verification FAILED with {} issue(s)", verdict.issues.len())
+                },
+                tokens_in: rev_outcome.tokens_in,
+                tokens_out: rev_outcome.tokens_out,
+                cached_in: rev_outcome.cached_in,
+            });
+
+            if !confirmable {
+                break;
+            }
+            if passed || fix_round >= MAX_FIX_ROUNDS {
+                break;
+            }
+
+            fix_round += 1;
+            tasks = normalize_tasks(
+                verdict
+                    .issues
+                    .iter()
+                    .enumerate()
+                    .map(|(i, issue)| SwarmPlanTask {
+                        id: (i + 1) as u32,
+                        kind: if issue.kind.eq_ignore_ascii_case("design") {
+                            "design".to_string()
+                        } else {
+                            "code".to_string()
+                        },
+                        description: format!("FIX: {}", issue.description),
+                        context: None,
+                        files: vec![],
+                        acceptance: format!("Resolve: {}", issue.description),
+                    })
+                    .collect(),
+            );
+        }
+
+        let verdict_state = match &verdict_opt {
+            Some(v) if v.passed => "All tasks finished and verified.".to_string(),
+            Some(v) => format!("Verification finished with issues: {}", v.summary),
+            None => "Execution finished UNVERIFIED (the reviewer produced no usable verdict)."
+                .to_string(),
+        };
+
+        ledger.execution_review = Some(truncate_chars(
+            &build_execution_review_ledger(exec_notes, &verdict_opt, &verdict_state),
+            LEDGER_EXEC_CHARS,
+        ));
+
+        Ok((verdict_opt, verdict_state))
+    }
 }
 
 fn parse_plan(args_json: &str) -> Result<SwarmPlan> {
@@ -2956,7 +3892,7 @@ pub fn resolve_plan_path(project_root: &Path) -> (PathBuf, String) {
     (modular_abs, modular_rel.to_string())
 }
 
-fn handoff_doc(project_root: &Path, args_json: &str, fallback_text: &str) -> Result<String> {
+pub(crate) fn handoff_doc(project_root: &Path, args_json: &str, fallback_text: &str) -> Result<String> {
     let v: serde_json::Value =
         serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
     let file_path = v.get("file_path").and_then(|x| x.as_str()).unwrap_or("");
@@ -3021,7 +3957,7 @@ fn persist_handoff_artifact(project_root: &Path, args_json: &str, content: &str)
 /// Unknown or unfetchable ids become a visible note instead of silently
 /// dropping data. This is a best-effort enrichment: if the kernel is
 /// unavailable the document is returned unchanged.
-async fn resolve_snippet_placeholders(project_root: &Path, doc: &str) -> String {
+pub(crate) async fn resolve_snippet_placeholders(project_root: &Path, doc: &str) -> String {
     let ids = collect_snippet_placeholder_ids(doc);
     if ids.is_empty() {
         return doc.to_string();
@@ -3943,7 +4879,7 @@ fn parse_brief_markdown(md: &str) -> Result<ResearchBrief> {
 }
 
 /// Document-level parsers: try the legacy JSON shape first, then markdown.
-fn parse_plan_doc(doc: &str) -> Result<SwarmPlan> {
+pub(crate) fn parse_plan_doc(doc: &str) -> Result<SwarmPlan> {
     let t = doc.trim();
     if t.starts_with('{') {
         parse_plan(t)
@@ -3952,7 +4888,7 @@ fn parse_plan_doc(doc: &str) -> Result<SwarmPlan> {
     }
 }
 
-fn parse_verdict_doc(doc: &str) -> Result<Verdict> {
+pub(crate) fn parse_verdict_doc(doc: &str) -> Result<Verdict> {
     let t = doc.trim();
     if t.starts_with('{') {
         parse_verdict(t)
@@ -3961,7 +4897,7 @@ fn parse_verdict_doc(doc: &str) -> Result<Verdict> {
     }
 }
 
-fn parse_audit_doc(doc: &str) -> Result<ContextAudit> {
+pub(crate) fn parse_audit_doc(doc: &str) -> Result<ContextAudit> {
     let t = doc.trim();
     if t.starts_with('{') {
         parse_audit(t)
@@ -3970,7 +4906,7 @@ fn parse_audit_doc(doc: &str) -> Result<ContextAudit> {
     }
 }
 
-fn parse_brief_doc(doc: &str) -> Result<ResearchBrief> {
+pub(crate) fn parse_brief_doc(doc: &str) -> Result<ResearchBrief> {
     let t = doc.trim();
     if t.starts_with('{') {
         parse_brief(t)
@@ -3981,7 +4917,7 @@ fn parse_brief_doc(doc: &str) -> Result<ResearchBrief> {
 
 /// Renders a plan back to the markdown template so roles in the shared context
 /// read plans as markdown (never JSON).
-fn render_plan_markdown(plan: &SwarmPlan) -> String {
+pub(crate) fn render_plan_markdown(plan: &SwarmPlan) -> String {
     let mut s = String::from("# Goal\n");
     s.push_str(&plan.goal);
     s.push('\n');
@@ -4083,7 +5019,7 @@ async fn prewarm_cache(
     }
 }
 
-fn normalize_tasks(mut tasks: Vec<SwarmPlanTask>) -> Vec<SwarmPlanTask> {
+pub(crate) fn normalize_tasks(mut tasks: Vec<SwarmPlanTask>) -> Vec<SwarmPlanTask> {
     for (i, task) in tasks.iter_mut().enumerate() {
         // Reassign sequential ids so duplicate ids emitted by a model never occur.
         task.id = (i + 1) as u32;
@@ -4172,7 +5108,7 @@ fn is_heavy_dir(name: &str) -> bool {
 /// relative path. Used to diff an executor's work against the tree as it was
 /// BEFORE the executor ran, so the report catches ANY change — including edits
 /// performed through `run_command` (which bypass the checkpoint system).
-fn snapshot_project_tree(tool_ctx: &ToolContext) -> HashMap<String, String> {
+pub(crate) fn snapshot_project_tree(tool_ctx: &ToolContext) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let mut total_bytes: u64 = 0;
     let walker = ignore::WalkBuilder::new(&tool_ctx.project_root)
@@ -4219,7 +5155,7 @@ fn snapshot_project_tree(tool_ctx: &ToolContext) -> HashMap<String, String> {
 /// Computes a compact text diff report of everything that changed in the project
 /// tree between `before` and the current state. This is the ONLY thing about
 /// executor work that enters the shared context.
-fn build_tree_diff_report(tool_ctx: &ToolContext, before: &HashMap<String, String>) -> String {
+pub(crate) fn build_tree_diff_report(tool_ctx: &ToolContext, before: &HashMap<String, String>) -> String {
     let after = snapshot_project_tree(tool_ctx);
 
     let mut keys: Vec<&String> = before.keys().chain(after.keys()).collect();
@@ -4309,7 +5245,7 @@ fn build_tree_diff_report(tool_ctx: &ToolContext, before: &HashMap<String, Strin
     report
 }
 
-fn truncate_chars(s: &str, max: usize) -> String {
+pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
@@ -4351,7 +5287,7 @@ pub fn build_ledger_message(ledger: &TurnLedger) -> Message {
 /// Condenses the executor notes + verdict into the compact `[EXECUTION REVIEW]`
 /// ledger segment. Not the 6000-char shared report — just file oneliners plus
 /// the verdict and (on failure) the top issues.
-fn build_execution_review_ledger(
+pub(crate) fn build_execution_review_ledger(
     exec_notes: &[String],
     verdict: &Option<Verdict>,
     verdict_state: &str,

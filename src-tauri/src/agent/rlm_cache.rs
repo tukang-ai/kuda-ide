@@ -369,12 +369,15 @@ pub fn build_manifest(
 
         // Fast path: reuse the stored sha when (size, mtime, ctime) all match.
         // ctime catches content writes that deliberately restore mtime; a
-        // legacy entry (ctime_ns == 0) is re-hashed once to stay sound.
+        // legacy entry (ctime_ns == 0, or an unknown ctime from the OS) must
+        // NOT take this fast path — it is re-hashed to stay sound against
+        // timestamp-preserving edits (`cp -p`, `rsync --times`, `touch -r`).
         let sha256 = match old.and_then(|o| o.files.get(&rel_str)) {
             Some(e)
                 if e.size == meta.len()
                     && e.mtime_ns == mtime_ns
-                    && (e.ctime_ns == 0 || e.ctime_ns == ctime_ns) =>
+                    && e.ctime_ns != 0
+                    && e.ctime_ns == ctime_ns =>
             {
                 e.sha256.clone()
             }

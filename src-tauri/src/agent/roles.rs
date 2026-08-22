@@ -20,6 +20,7 @@ pub enum AgentRole {
     ExecutorReviewer,
     RlmModel,
     RlmVerifier,
+    ChatCoordinator,
 }
 
 impl AgentRole {
@@ -35,6 +36,7 @@ impl AgentRole {
             AgentRole::ExecutorReviewer => "executor_reviewer",
             AgentRole::RlmModel => "rlm_model",
             AgentRole::RlmVerifier => "rlm_verifier",
+            AgentRole::ChatCoordinator => "chat_coordinator",
         }
     }
 
@@ -50,6 +52,7 @@ impl AgentRole {
             AgentRole::ExecutorReviewer => "Executor Reviewer",
             AgentRole::RlmModel => "RLM Model",
             AgentRole::RlmVerifier => "RLM Verifier",
+            AgentRole::ChatCoordinator => "Chat Coordinator",
         }
     }
 
@@ -193,6 +196,17 @@ impl AgentRole {
                     "submit_audit".into(),
                 ],
             },
+            AgentRole::ChatCoordinator => RoleSpec {
+                role: *self,
+                max_turns: 16,
+                temperature: 0.3,
+                allowed_tools: vec![
+                    "call_rlm_research".into(),
+                    "call_thinker_direction".into(),
+                    "call_planning_swarm".into(),
+                    "call_executor".into(),
+                ],
+            },
         }
     }
 }
@@ -243,6 +257,7 @@ fn role_model_refs(role: AgentRole, cfg: &crate::agent::provider_config::AgentCo
         AgentRole::ExecutorReviewer => vec![cfg.executor_reviewer.clone()],
         AgentRole::RlmModel => vec![cfg.rlm_model.clone()],
         AgentRole::RlmVerifier => vec![cfg.rlm_verifier.clone()],
+        AgentRole::ChatCoordinator => vec![cfg.chat_coordinator.clone()],
     }
 }
 
@@ -428,16 +443,18 @@ mod tests {
             AgentRole::Reviewer,
             AgentRole::PlanningWriter,
             AgentRole::PlanReviewer,
+            AgentRole::PlanEditor,
             AgentRole::ExecutorCode,
             AgentRole::ExecutorDesign,
             AgentRole::ExecutorReviewer,
             AgentRole::RlmModel,
             AgentRole::RlmVerifier,
+            AgentRole::ChatCoordinator,
         ];
         let mut keys: Vec<&str> = roles.iter().map(|r| r.key()).collect();
         keys.sort();
         keys.dedup();
-        assert_eq!(keys.len(), 9);
+        assert_eq!(keys.len(), 11);
     }
 
     #[test]
@@ -448,6 +465,8 @@ mod tests {
         assert!(!AgentRole::RlmVerifier.is_smart_tier());
         assert!(!AgentRole::PlanningWriter.is_smart_tier());
         assert!(!AgentRole::PlanReviewer.is_smart_tier());
+        assert!(!AgentRole::PlanEditor.is_smart_tier());
+        assert!(!AgentRole::ChatCoordinator.is_smart_tier());
         assert!(AgentRole::Thinker.is_smart_tier());
         assert!(AgentRole::Reviewer.is_smart_tier());
         assert!(AgentRole::ExecutorReviewer.is_smart_tier());
@@ -566,5 +585,16 @@ mod tests {
             );
         }
         assert!(!AgentRole::PlanEditor.is_smart_tier());
+    }
+
+    #[test]
+    fn test_chat_coordinator_spec() {
+        let spec = AgentRole::ChatCoordinator.spec();
+        assert_eq!(spec.allowed_tools.len(), 4);
+        assert!(spec.allowed_tools.contains(&"call_rlm_research".to_string()));
+        assert!(spec.allowed_tools.contains(&"call_thinker_direction".to_string()));
+        assert!(spec.allowed_tools.contains(&"call_planning_swarm".to_string()));
+        assert!(spec.allowed_tools.contains(&"call_executor".to_string()));
+        assert!(!AgentRole::ChatCoordinator.is_smart_tier());
     }
 }

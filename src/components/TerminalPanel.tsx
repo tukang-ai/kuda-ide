@@ -10,15 +10,43 @@ import type { TerminalOutputPayload } from '../types';
 
 type Listener = (data: string) => void;
 const bus = new Map<string, Set<Listener>>();
+// Bytes that arrived BEFORE any TerminalHost subscribed to the session
+// (`terminalSpawn` resolves and publishes before React commits the host).
+// Without buffering, the shell's first prompt/MOTD was silently dropped.
+const pending = new Map<string, string[]>();
+const PENDING_CAP_CHARS = 100_000;
 
 function publish(sessionId: string, data: string) {
-  bus.get(sessionId)?.forEach((fn) => fn(data));
+  const subs = bus.get(sessionId);
+  if (!subs || subs.size === 0) {
+    const buf = pending.get(sessionId) ?? [];
+    if (buf.join('').length < PENDING_CAP_CHARS) {
+      buf.push(data);
+      pending.set(sessionId, buf);
+    }
+    return;
+  }
+  subs.forEach((fn) => fn(data));
 }
 
 function subscribe(sessionId: string, fn: Listener): () => void {
   if (!bus.has(sessionId)) bus.set(sessionId, new Set());
   bus.get(sessionId)!.add(fn);
-  return () => bus.get(sessionId)?.delete(fn);
+  // Replay anything captured before the first subscriber attached.
+  const buffered = pending.get(sessionId);
+  if (buffered) {
+    pending.delete(sessionId);
+    for (const chunk of buffered) fn(chunk);
+  }
+  return () => {
+    bus.get(sessionId)?.delete(fn);
+    if (bus.get(sessionId)?.size === 0) bus.delete(sessionId);
+  };
+}
+
+function dropSessionBuffers(sessionId: string) {
+  bus.delete(sessionId);
+  pending.delete(sessionId);
 }
 
 const TerminalHost: React.FC<{ sessionId: string; active: boolean }> = ({ sessionId, active }) => {
@@ -116,6 +144,28 @@ export const TerminalPanel: React.FC = () => {
   const [activeId, setActiveId] = useState<string | null>(null);
   const counter = useRef(0);
   const spawning = useRef(false);
+  // Mirror of `sessions` for interval callbacks (which capture a stale
+  // closure otherwise).
+  const sessionsRef = useRef<PtyTab[]>([]);
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
+
+  /** Removes a tab's buffers and selects a NEIGHBOR when the killed tab was
+   * active — setting activeId to null while other shells are alive used to
+   * leave every remaining host display:none (panel looked dead). */
+  const removeTab = (id: string) => {
+    dropSessionBuffers(id);
+    const current = sessionsRef.current;
+    const idx = current.findIndex((t) => t.id === id);
+    const remaining = current.filter((t) => t.id !== id);
+    setSessions(remaining);
+    setActiveId((cur) => {
+      if (cur !== id) return cur;
+      if (remaining.length === 0) return null;
+      return remaining[Math.min(Math.max(idx, 0), remaining.length - 1)].id;
+    });
+  };
 
   const spawn = useCallback(async () => {
     if (spawning.current) return;
@@ -144,10 +194,18 @@ export const TerminalPanel: React.FC = () => {
     const poll = setInterval(async () => {
       try {
         const live = await ipc.terminalList();
-        setSessions((s) => {
-          if (s.every((t) => live.includes(t.id))) return s;
-          const remaining = s.filter((t) => live.includes(t.id));
-          return remaining;
+        const liveSet = new Set(live);
+        const current = sessionsRef.current;
+        const dead = current.filter((t) => !liveSet.has(t.id));
+        if (dead.length === 0) return;
+        dead.forEach((t) => dropSessionBuffers(t.id));
+        const remaining = current.filter((t) => liveSet.has(t.id));
+        setSessions(remaining);
+        setActiveId((cur) => {
+          if (!cur || liveSet.has(cur)) return cur;
+          if (remaining.length === 0) return null;
+          const deadIdx = current.findIndex((t) => t.id === cur);
+          return remaining[Math.min(Math.max(deadIdx, 0), remaining.length - 1)].id;
         });
       } catch { /* backend not ready */ }
     }, 3000);
@@ -164,12 +222,7 @@ export const TerminalPanel: React.FC = () => {
     try {
       await ipc.terminalKill(id);
     } catch { /* already gone */ }
-    bus.delete(id);
-    setSessions((s) => s.filter((t) => t.id !== id));
-    setActiveId((current) => {
-      if (current !== id) return current;
-      return null;
-    });
+    removeTab(id);
   };
 
   return (

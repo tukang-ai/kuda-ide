@@ -64,6 +64,8 @@ pub struct AgentConfig {
     pub rlm_model: ModelRef,
     #[serde(default)]
     pub rlm_verifier: ModelRef,
+    #[serde(default)]
+    pub chat_coordinator: ModelRef,
     /// Plan Approval Gate: when enabled, the swarm pauses after the Thinker's
     /// plan and waits for the user to edit / request a reviewer / execute.
     /// Default ON (human-in-the-loop before the most expensive phase).
@@ -88,6 +90,7 @@ impl Default for AgentConfig {
             executor_reviewer: ModelRef::default(),
             rlm_model: ModelRef::default(),
             rlm_verifier: ModelRef::default(),
+            chat_coordinator: ModelRef::default(),
             plan_gate_enabled: true,
         }
     }
@@ -122,6 +125,7 @@ impl Default for ProviderConfig {
             "executor_reviewer".to_string(),
             "rlm_model".to_string(),
             "rlm_verifier".to_string(),
+            "chat_coordinator".to_string(),
         ];
         let bind = |model: &str| ModelRef {
             provider_id: "kuda_hub".to_string(),
@@ -145,6 +149,7 @@ impl Default for ProviderConfig {
                 executor_reviewer: bind("executor_reviewer"),
                 rlm_model: bind("rlm_model"),
                 rlm_verifier: bind("rlm_verifier"),
+                chat_coordinator: bind("chat_coordinator"),
                 plan_gate_enabled: true,
             },
         }
@@ -186,6 +191,12 @@ impl ProviderConfigManager {
             cfg.agent.plan_editor = ModelRef {
                 provider_id: "kuda_hub".to_string(),
                 model: "plan_editor".to_string(),
+            };
+        }
+        if cfg.agent.chat_coordinator.provider_id.is_empty() {
+            cfg.agent.chat_coordinator = ModelRef {
+                provider_id: "kuda_hub".to_string(),
+                model: "chat_coordinator".to_string(),
             };
         }
         Ok(cfg)

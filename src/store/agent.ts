@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import * as ipc from '../lib/ipc';
-import type { AgentEvent, AgentRoleKey, ChatMessage, ChatSessionMeta, PhaseRecord } from '../types';
+import type { AgentEvent, AgentRoleKey, ChatMessage, ChatSessionMeta, ChatSessionData } from '../types';
 import { StreamTextBuffer, type FlushedText } from './streamBuffer';
 
 export interface UiToolCall {
@@ -38,6 +38,7 @@ export interface UiMessage {
   runId?: string;
   /** When true the agent section is collapsed. New phases auto-minimize older ones. */
   minimized?: boolean;
+  timestamp?: number;
 }
 
 export interface PendingExternalRequest {
@@ -66,6 +67,7 @@ interface AgentState {
   hasCustomProvider: boolean;
   showHistory: boolean;
   swarmMode: boolean;
+  agentMode: 'chat' | 'coordinator' | 'swarm';
   lastEditSessionId: string | null;
   /** Run id of the currently active agent run (used to cancel it). */
   currentRunId: string | null;
@@ -77,6 +79,7 @@ interface AgentState {
   setAutoApprove: (v: boolean) => void;
   setPlanGateEnabled: (v: boolean) => void;
   setSwarmMode: (v: boolean) => void;
+  setAgentMode: (mode: 'chat' | 'coordinator' | 'swarm') => void;
 
   newChat: () => void;
   loadHistory: (sessionId: string) => Promise<void>;
@@ -118,48 +121,152 @@ export interface PendingDirection {
   conclusion: string;
 }
 
-function mapTranscript(transcript: PhaseRecord[]): UiMessage[] {
-  return transcript.map((rec) => ({
-    id: nextId(),
-    role: 'assistant',
-    content: rec.text,
-    thinking: rec.thinking,
-    toolCalls: rec.tool_calls.map((tc) => ({
-      callId: tc.call_id,
-      toolName: tc.tool_name,
-      argumentsJson: tc.arguments_json,
-      output: tc.output,
-      status: tc.status as UiToolCall['status'],
-    })),
-    agentRole: rec.role as AgentRoleKey | undefined,
-    phaseLabel: rec.label,
-    phaseModel: rec.model,
-    phaseSummary: rec.summary,
-    runId: rec.run_id,
-    minimized: true,
-  }));
-}
+function reconstructHistory(data: ChatSessionData): UiMessage[] {
+  interface TimestampedItem {
+    msg: UiMessage;
+    timestamp: number;
+    seq: number;
+  }
 
-function mapMessages(messages: ChatMessage[]): UiMessage[] {
-  const out: UiMessage[] = [];
-  for (const m of messages) {
+  const items: TimestampedItem[] = [];
+  let seq = 0;
+
+  // 1. Index tool responses from messages for attaching outputs to direct chat tool calls
+  const toolOutputMap = new Map<string, string>();
+  for (const m of data.messages || []) {
+    if (m.role === 'Tool' && m.tool_call_id) {
+      toolOutputMap.set(m.tool_call_id, m.content);
+    }
+  }
+
+  // 2. Extract user prompts and direct chat assistant answers from data.messages
+  for (const m of data.messages || []) {
+    const timestamp = m.created_at ? new Date(m.created_at).getTime() : 0;
+
     if (m.role === 'User') {
-      out.push({ id: nextId(), role: 'user', content: m.content });
-    } else if (m.role === 'Assistant' || m.role === 'System') {
-      out.push({
-        id: nextId(),
-        role: 'assistant',
-        content: m.content,
-        minimized: true,
+      items.push({
+        msg: {
+          id: nextId(),
+          role: 'user',
+          content: m.content,
+          timestamp,
+        },
+        timestamp,
+        seq: ++seq,
+      });
+    } else if (m.role === 'Assistant') {
+      // Exclude internal turn ledgers and epoch summaries which are already
+      // accurately presented as phase cards in transcript
+      if (m.name === 'ledger' || m.name === 'epoch') {
+        continue;
+      }
+
+      const toolCalls: UiToolCall[] = (m.tool_calls || []).map((tc) => {
+        const rawOutput = toolOutputMap.get(tc.call_id) || '';
+        let status: UiToolCall['status'] = toolOutputMap.has(tc.call_id) ? 'done' : 'running';
+        // A persisted Tool-role payload is a serialized ToolResult whose
+        // `is_error` flag distinguishes REJECTED/FAILED calls (approval gate,
+        // malformed args, execution error) from real work. Replaying those as
+        // "done" made audits of a failed run misleading.
+        if (status === 'done' && rawOutput.startsWith('{')) {
+          try {
+            if (JSON.parse(rawOutput)?.is_error === true) {
+              status = 'error';
+            }
+          } catch {
+            /* non-JSON payload stays 'done' */
+          }
+        }
+        return {
+          callId: tc.call_id,
+          toolName: tc.tool_name,
+          argumentsJson: tc.arguments_json,
+          output: rawOutput,
+          status,
+        };
+      });
+
+      items.push({
+        msg: {
+          id: nextId(),
+          role: m.name === 'error' ? 'error' : 'assistant',
+          content: m.content,
+          thinking: m.reasoning_content || undefined,
+          toolCalls,
+          minimized: true,
+          timestamp,
+        },
+        timestamp,
+        seq: ++seq,
+      });
+    } else if (m.role === 'System') {
+      if (m.name === 'epoch') {
+        continue;
+      }
+      items.push({
+        msg: {
+          id: nextId(),
+          role: 'assistant',
+          content: m.content,
+          minimized: true,
+          timestamp,
+        },
+        timestamp,
+        seq: ++seq,
       });
     }
   }
-  return out;
+
+  // 3. Extract Swarm / Coordinator phase records from data.transcript
+  for (const rec of data.transcript || []) {
+    const timestamp = rec.created_at ? new Date(rec.created_at).getTime() : 0;
+    items.push({
+      msg: {
+        id: nextId(),
+        role: 'assistant',
+        content: rec.text,
+        thinking: rec.thinking,
+        toolCalls: rec.tool_calls.map((tc) => ({
+          callId: tc.call_id,
+          toolName: tc.tool_name,
+          argumentsJson: tc.arguments_json,
+          output: tc.output,
+          status: tc.status as UiToolCall['status'],
+        })),
+        agentRole: rec.role as AgentRoleKey | undefined,
+        phaseLabel: rec.label,
+        phaseModel: rec.model,
+        phaseSummary: rec.summary,
+        runId: rec.run_id,
+        minimized: true,
+        timestamp,
+      },
+      timestamp,
+      seq: ++seq,
+    });
+  }
+
+  // 4. Stable chronological sort
+  items.sort((a, b) => {
+    if (a.timestamp > 0 && b.timestamp > 0 && a.timestamp !== b.timestamp) {
+      return a.timestamp - b.timestamp;
+    }
+    // If timestamps are identical or absent, user prompt goes before assistant phases
+    if (a.msg.role === 'user' && b.msg.role !== 'user') return -1;
+    if (a.msg.role !== 'user' && b.msg.role === 'user') return 1;
+    return a.seq - b.seq;
+  });
+
+  return items.map((i) => i.msg);
 }
 
 /// Single shared interval so calling `init()` multiple times (App mount +
 /// AgentPanel mount) never starts duplicate refresh/check timers.
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
+// Guards the hub-auth-success listener: init() also runs on project open/close
+// (AgentPanel effect), and discarding UnlistenFn stacked N listeners that each
+// fired redundant work on every auth event. Bind exactly once per app lifetime.
+let authListenerBound = false;
 
 export const useAgent = create<AgentState>((set, get) => ({
   sessions: [],
@@ -178,18 +285,22 @@ export const useAgent = create<AgentState>((set, get) => ({
   hasCustomProvider: false,
   showHistory: false,
   swarmMode: true,
+  agentMode: 'swarm',
   lastEditSessionId: null,
   currentRunId: null,
   resumeTarget: null,
 
   init: async () => {
     await get().checkKey();
-    listen<ipc.HubAccount>('hub-auth-success', (event) => {
-      if (event.payload?.logged_in) {
-        set({ hasHubKey: true });
-        get().checkKey();
-      }
-    }).catch(() => {});
+    if (!authListenerBound) {
+      authListenerBound = true;
+      listen<ipc.HubAccount>('hub-auth-success', (event) => {
+        if (event.payload?.logged_in) {
+          set({ hasHubKey: true });
+          get().checkKey();
+        }
+      }).catch(() => {});
+    }
     // Re-probe once shortly after startup: the very first IPC invoke can race
     // webview initialization, which used to leave the badge red until the user
     // happened to open Settings (which triggers another checkKey).
@@ -269,7 +380,8 @@ export const useAgent = create<AgentState>((set, get) => ({
     }
   },
 
-  setSwarmMode: (v) => set({ swarmMode: v }),
+  setSwarmMode: (v) => set({ swarmMode: v, agentMode: v ? 'swarm' : 'chat' }),
+  setAgentMode: (mode) => set({ agentMode: mode, swarmMode: mode === 'swarm' }),
 
   bindExternalEvents: () => {
     const channel = new Channel<AgentEvent>();
@@ -320,16 +432,11 @@ export const useAgent = create<AgentState>((set, get) => ({
     try {
       resetStreamBuffer();
       const data = await ipc.chatLoadSession(sessionId);
-      // Backend transcript is the display source of truth. Sessions created
-      // before the ledger/transcript feature (or plain chats) fall back to
-      // the backend messages (user prompt + final answer).
-      const transcript = data.transcript?.length
-        ? mapTranscript(data.transcript)
-        : null;
+      const restored = reconstructHistory(data);
       set({
         activeSessionId: sessionId,
-        historyMessages: transcript ? [] : data.messages,
-        liveMessages: transcript ?? mapMessages(data.messages),
+        historyMessages: data.messages,
+        liveMessages: restored,
         error: null,
         showHistory: false,
         resumeTarget: null,
@@ -343,18 +450,29 @@ export const useAgent = create<AgentState>((set, get) => ({
     try {
       await ipc.chatDeleteSession(sessionId);
       const sessions = await ipc.chatListSessions();
-      set((s) => ({
-        sessions,
-        activeSessionId: s.activeSessionId === sessionId ? null : s.activeSessionId,
-        historyMessages: s.activeSessionId === sessionId ? [] : s.historyMessages,
-      }));
+      set((s) => {
+        const wasActive = s.activeSessionId === sessionId;
+        return {
+          sessions,
+          activeSessionId: wasActive ? null : s.activeSessionId,
+          historyMessages: wasActive ? [] : s.historyMessages,
+          // Deleting the ACTIVE session must also clear its live artifacts:
+          // the deleted transcript stayed on screen and resumeTarget /
+          // pending gates pointed at a now-deleted session (guaranteed
+          // failure on click).
+          liveMessages: wasActive ? [] : s.liveMessages,
+          resumeTarget: wasActive ? null : s.resumeTarget,
+          pendingDirection: wasActive ? null : s.pendingDirection,
+          pendingPlanDecision: wasActive ? null : s.pendingPlanDecision,
+        };
+      });
     } catch (err) {
       set({ error: String(err) });
     }
   },
 
   send: async (prompt, refreshWorkspace) => {
-    const { busy, activeSessionId, autoApprove, swarmMode } = get();
+    const { busy, activeSessionId, autoApprove } = get();
     if (busy || !prompt.trim()) return;
 
     // Generate the run id up front so it can cancel the run while it is active
@@ -366,11 +484,12 @@ export const useAgent = create<AgentState>((set, get) => ({
 
     const userMsg: UiMessage = { id: nextId(), role: 'user', content: prompt, runId };
     const userMsgId = userMsg.id;
-    // In swarm mode the assistant bubbles are created per PhaseStarted event
-    // (one bubble per role); legacy mode uses a single assistant bubble.
+    // In swarm and coordinator modes the assistant bubbles are created per PhaseStarted event
+    // (one bubble per role); direct chat mode uses a single upfront assistant bubble.
     // Every message of a run shares `runId` so the UI can render the whole run
     // as a single box with one collapsible section per agent.
-    const seedMessages = swarmMode
+    const isSingleChat = get().agentMode === 'chat';
+    const seedMessages = !isSingleChat
       ? [userMsg]
       : [
           userMsg,
@@ -402,9 +521,13 @@ export const useAgent = create<AgentState>((set, get) => ({
     const { wasTouched } = bindRunChannel(channel, runId);
 
     try {
-      const result = swarmMode
-        ? await ipc.agentSwarmChat(prompt, activeSessionId, autoApprove, channel, runId)
-        : await ipc.agentChat(prompt, activeSessionId, autoApprove, channel, runId);
+      const currentMode = get().agentMode;
+      const result =
+        currentMode === 'swarm'
+          ? await ipc.agentSwarmChat(prompt, activeSessionId, autoApprove, channel, runId)
+          : currentMode === 'coordinator'
+          ? await ipc.agentCoordinatorChat(prompt, activeSessionId, autoApprove, channel, runId)
+          : await ipc.agentChat(prompt, activeSessionId, autoApprove, channel, runId);
       set((s) => ({
         activeSessionId: result.chat_session_id,
         lastEditSessionId: result.edit_session_id,

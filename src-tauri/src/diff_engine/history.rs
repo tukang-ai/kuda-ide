@@ -272,6 +272,25 @@ impl CheckpointManager {
             let target_file =
                 PathGuard::validate_path_in_scope(&checkpoint.original_file_path, project_root)?;
 
+            // SAFETY NET: snapshot the CURRENT content before it is overwritten
+            // or removed. Without this, reverting a session destroys any work
+            // done after that session (manual edits or later runs)
+            // irreversibly. The safety snapshot is a normal checkpoint tagged
+            // "pre-revert", so the revert itself stays undoable.
+            if target_file.exists() {
+                self.create_checkpoint_in_session(
+                    &target_file,
+                    Some("pre-revert".to_string()),
+                    None,
+                )
+                .map_err(|e| {
+                    AppError::General(format!(
+                        "Refusing to revert session '{}': cannot snapshot current state of {:?}: {}",
+                        session_id, target_file, e
+                    ))
+                })?;
+            }
+
             if !checkpoint.existed_before {
                 // File was created during the session -> remove it.
                 if target_file.exists() {
@@ -295,7 +314,13 @@ impl CheckpointManager {
                         fs::create_dir_all(parent)?;
                     }
                 }
-                let tmp_path = target_file.with_extension("tmp_restore");
+                // Unique staging name (UUID suffix): a fixed name would collide
+                // when two restores of same-stem files (main.rs / main.ts) run
+                // concurrently, corrupting whichever rename lands second.
+                let tmp_path = target_file.with_extension(format!(
+                    "tmp_restore_{}",
+                    &Uuid::new_v4().simple().to_string()[..8]
+                ));
                 fs::write(&tmp_path, &backup_bytes)?;
                 fs::rename(&tmp_path, &target_file)?;
                 tracing::info!(
@@ -319,6 +344,23 @@ impl CheckpointManager {
         // 1. Validate security boundary
         let target_file = PathGuard::validate_path_in_scope(&checkpoint.original_file_path, project_root)?;
 
+        // SAFETY NET: snapshot the CURRENT content before it gets overwritten
+        // or removed so restoring an older checkpoint never destroys newer
+        // work irreversibly.
+        if target_file.exists() {
+            self.create_checkpoint_in_session(
+                &target_file,
+                Some("pre-restore".to_string()),
+                None,
+            )
+            .map_err(|e| {
+                AppError::General(format!(
+                    "Refusing to restore checkpoint '{}': cannot snapshot current state of {:?}: {}",
+                    checkpoint.checkpoint_id, target_file, e
+                ))
+            })?;
+        }
+
         if !checkpoint.existed_before {
             // The checkpoint was taken for a newly created file -> remove it.
             if target_file.exists() {
@@ -337,8 +379,12 @@ impl CheckpointManager {
         // 2. Read full backup content
         let backup_bytes = fs::read(&checkpoint.backup_file_path)?;
 
-        // 3. Atomic overwrite of original file with full backup content
-        let tmp_path = target_file.with_extension("tmp_restore");
+        // 3. Atomic overwrite of original file with full backup content,
+        //    using a unique staging name (see revert_session).
+        let tmp_path = target_file.with_extension(format!(
+            "tmp_restore_{}",
+            &Uuid::new_v4().simple().to_string()[..8]
+        ));
         fs::write(&tmp_path, &backup_bytes)?;
         fs::rename(&tmp_path, &target_file)?;
 

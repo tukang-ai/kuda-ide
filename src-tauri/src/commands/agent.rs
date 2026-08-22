@@ -149,7 +149,19 @@ pub async fn agent_poll_hub_login(
     }
 
     let base_url = crate::agent::provider_config::HUB_BASE_URL.trim_end_matches('/');
-    let url = format!("{}/auth/pending?verifier={}", base_url, verifier_clean);
+    // Percent-encode the verifier: interpolating it raw into the query string
+    // let characters like `&`, `#` or `%` inject extra query parameters toward
+    // the Hub auth endpoint (textbook parameter injection).
+    let verifier_encoded: String = verifier_clean
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            other => format!("%{:02X}", other),
+        })
+        .collect();
+    let url = format!("{}/auth/pending?verifier={}", base_url, verifier_encoded);
 
     let resp = client.get(&url).send().await
         .map_err(|e| AppError::General(format!("Hub poll network error: {e}")))?;
@@ -684,7 +696,145 @@ pub async fn agent_swarm_chat(
     // prompt, so the recent-turn prefix stays cache-friendly and verbatim.
     // Hold the session lock across the load→compact→save so a concurrent
     // append cannot interleave and lose the compaction write.
-    let _guard = crate::agent::chat_history::SESSION_IO_LOCK.lock().unwrap();
+    let _guard = crate::agent::chat_history::session_io_lock();
+    if let Ok(mut session_for_compact) = history_mgr.load_session(&session.meta.session_id) {
+        if let Err(e) = crate::agent::chat_history::compact_epoch(&mut session_for_compact) {
+            tracing::warn!("Epoch compaction skipped: {}", e);
+        } else if let Err(e) = history_mgr.save_session_unlocked(&session_for_compact) {
+            tracing::warn!("Epoch compaction save failed: {}", e);
+        }
+    }
+
+    Ok(AgentRunResult {
+        chat_session_id: session.meta.session_id,
+        edit_session_id: Some(edit_session_id),
+    })
+}
+
+/// Runs the Chat Coordinator mode (frontline coordinator with agent-as-a-tool delegation).
+#[tauri::command]
+pub async fn agent_coordinator_chat(
+    state: State<'_, AppState>,
+    user_prompt: String,
+    session_id: Option<String>,
+    auto_approve: bool,
+    run_id: Option<String>,
+    on_event: Channel<AgentEvent>,
+) -> Result<AgentRunResult> {
+    let project_root = state.require_project_root()?;
+    let app_data_dir = state.require_app_data_dir()?;
+    let tool_registry = state.tool_registry.clone();
+    let edit_session_id = run_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    if let Some(id) = &session_id {
+        if !id.is_empty() && !crate::agent::chat_history::is_safe_id(id) {
+            return Err(AppError::General(
+                "Invalid session_id: must be a plain identifier without path separators".to_string(),
+            ));
+        }
+    }
+    if !crate::agent::chat_history::is_safe_id(&edit_session_id) {
+        return Err(AppError::General(
+            "Invalid run_id: must be a plain identifier without path separators".to_string(),
+        ));
+    }
+
+    crate::agent::hub_session::ensure_hub_session(&app_data_dir).await?;
+
+    let history_mgr = ChatHistoryManager::new(&app_data_dir)?;
+    let session: ChatSessionData = match &session_id {
+        Some(id) if !id.is_empty() => history_mgr.load_session(id)?,
+        _ => history_mgr.create_session(None)?,
+    };
+
+    let user_message = Message {
+        role: MessageRole::User,
+        content: user_prompt.clone(),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+        created_at: None,
+    };
+    history_mgr.append_message(&session.meta.session_id, user_message.clone(), None)?;
+
+    let orchestrator = crate::agent::chat_orchestrator::ChatOrchestrator::new(tool_registry);
+    let cancel = crate::agent::tool_registry::CancelFlag::new();
+    let tool_ctx = ToolContext {
+        project_root: project_root.clone(),
+        app_data_dir: app_data_dir.clone(),
+        external_requests: state.external_requests.clone(),
+        plan_decisions: state.plan_decisions.clone(),
+        direction_decisions: state.direction_decisions.clone(),
+        session_id: Some(edit_session_id.clone()),
+        cancel: cancel.clone(),
+    };
+
+    let context_messages = crate::agent::chat_history::build_ledger_context(
+        &session.messages,
+        &user_message,
+    );
+
+    state
+        .active_runs
+        .lock()
+        .unwrap()
+        .entry(edit_session_id.clone())
+        .or_default()
+        .push(cancel);
+    let run_channel_id = state.external_requests.register_channel(on_event.clone());
+    let transcript_collector: Arc<Mutex<TranscriptCollector>> = Arc::new(Mutex::new(
+        TranscriptCollector::new(edit_session_id.clone()),
+    ));
+    let run_result = orchestrator
+        .run_coordinator_chat(
+            &context_messages,
+            &tool_ctx,
+            auto_approve,
+            &on_event,
+            &transcript_collector,
+        )
+        .await;
+    state.external_requests.unregister_channel(run_channel_id);
+    remove_active_run(&state, &edit_session_id, &tool_ctx.cancel);
+
+    let outcome = match run_result {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            if let Ok(mut col) = transcript_collector.lock() {
+                let partial = col.finish();
+                if !partial.is_empty() {
+                    if let Err(pe) = history_mgr.append_transcript(&session.meta.session_id, &partial) {
+                        tracing::warn!("Failed to persist partial transcript: {}", pe);
+                    }
+                }
+            }
+            history_mgr.append_message(
+                &session.meta.session_id,
+                Message {
+                    role: MessageRole::Assistant,
+                    content: format!("Run failed: {}", e),
+                    name: Some("error".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    created_at: None,
+                },
+                None,
+            )?;
+            return Err(e);
+        }
+    };
+
+    let ledger_msg = build_ledger_message(&outcome.ledger);
+    history_mgr.append_message(&session.meta.session_id, ledger_msg, None)?;
+    crate::agent::swarm::clear_checkpoint(&app_data_dir, &edit_session_id);
+    if !outcome.transcript.is_empty() {
+        history_mgr.append_transcript(&session.meta.session_id, &outcome.transcript)?;
+    }
+    let _guard = crate::agent::chat_history::session_io_lock();
     if let Ok(mut session_for_compact) = history_mgr.load_session(&session.meta.session_id) {
         if let Err(e) = crate::agent::chat_history::compact_epoch(&mut session_for_compact) {
             tracing::warn!("Epoch compaction skipped: {}", e);
@@ -817,7 +967,7 @@ pub async fn agent_resume_run(
     }
     // Hold the session lock across the load→compact→save so a concurrent
     // append cannot interleave and lose the compaction write.
-    let _guard = crate::agent::chat_history::SESSION_IO_LOCK.lock().unwrap();
+    let _guard = crate::agent::chat_history::session_io_lock();
     if let Ok(mut session_for_compact) = history_mgr.load_session(&session.meta.session_id) {
         if let Err(e) = crate::agent::chat_history::compact_epoch(&mut session_for_compact) {
             tracing::warn!("Epoch compaction skipped: {}", e);

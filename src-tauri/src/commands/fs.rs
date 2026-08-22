@@ -32,7 +32,18 @@ async fn resolve_in_scope(
                 .request_approval(&target.display().to_string(), reason, kind)
                 .await;
             if allowed {
-                let canonical = PathGuard::canonicalize_unchecked(target)
+                // Resolve RELATIVE paths against the project root exactly like
+                // `validate_path_in_scope` does BEFORE canonicalizing.
+                // Canonicalizing the raw input would interpret a relative
+                // target (e.g. "../secrets.txt") against the PROCESS CWD, so
+                // the file actually read/written/deleted could differ from the
+                // path shown in (and approved by) the Allow/Deny dialog.
+                let resolved = if target.is_absolute() {
+                    target.clone()
+                } else {
+                    root.join(target)
+                };
+                let canonical = PathGuard::canonicalize_unchecked(&resolved)
                     .map_err(|e| AppError::Security(e))?;
                 // Same broad-root guard as the RLM kernel allowlist: approving
                 // `/`, the home directory or a system tree with one click would

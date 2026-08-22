@@ -45,6 +45,31 @@ impl CancelFlag {
         self.inner.1.notified()
     }
 
+    /// Resolves as soon as the flag is cancelled — INCLUDING when it was
+    /// already cancelled before the caller armed this future. Await sites must
+    /// prefer this over raw `notified()`: `Notify` stores at most ONE permit,
+    /// so a waiter that registers after a previous waiter consumed it (e.g.
+    /// the next iteration of the external-access approval loop, or a second
+    /// concurrent tool select!) would otherwise sleep until its own timeout
+    /// even though the user pressed Stop. Every loop iteration re-checks the
+    /// atomic, so cancellation always terminates the wait.
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let notified = self.inner.1.notified();
+            tokio::pin!(notified);
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+            if self.is_cancelled() {
+                return;
+            }
+        }
+    }
+
     /// Identity comparison (same underlying flag), used to remove exactly this
     /// run's entry from a shared `active_runs` bucket without touching sibling
     /// runs that happen to share the same run id.
@@ -340,6 +365,10 @@ impl ToolRegistry {
         registry.register(Arc::new(RequestExternalAccessTool));
         registry.register(Arc::new(crate::agent::rlm_kernel::RlmPythonTool));
         registry.register(Arc::new(CodeOutlineTool));
+        registry.register(Arc::new(CallRlmResearchTool));
+        registry.register(Arc::new(CallThinkerDirectionTool));
+        registry.register(Arc::new(CallPlanningSwarmTool));
+        registry.register(Arc::new(CallExecutorTool));
 
         registry
     }
@@ -739,19 +768,51 @@ impl Tool for MultiReplaceFileTool {
             let range = &content[range_start..range_end];
             let abs = if let Some(rel) = range.find(chunk.target_content.as_str()) {
                 range_start + rel
-            } else if let Some(pos) = content.find(chunk.target_content.as_str()) {
-                // Line shifted from earlier edits or minor index drift: match in full content
-                pos
             } else {
-                let actual_preview: String = content.lines().skip(first).take(last - first + 1).collect::<Vec<_>>().join("\n");
-                return Ok(ToolResult {
-                    success: false,
-                    output: format!(
-                        "Target content chunk not found in file.\nExpected target:\n{:?}\nActual content currently at line {}-{}:\n{}\nPlease check exact characters and match the actual text.",
-                        chunk.target_content, chunk.start_line, chunk.end_line, actual_preview
-                    ),
-                    is_error: true,
-                });
+                // Line shifted from earlier edits or minor index drift: fall
+                // back to a whole-file search, but ONLY when the target text
+                // occurs EXACTLY ONCE. Blindly replacing the first occurrence
+                // used to silently edit an unrelated site (duplicate braces,
+                // blank lines, repeated statements like `self.x = x;`), which
+                // then cascaded: later chunks' ranges shifted again and fell
+                // back too, compounding the corruption.
+                let mut occurrences = content.match_indices(chunk.target_content.as_str());
+                let first_match = occurrences.next().map(|(i, _)| i);
+                let ambiguous = first_match.is_some() && occurrences.next().is_some();
+                if ambiguous {
+                    let sites = content
+                        .match_indices(chunk.target_content.as_str())
+                        .take(3)
+                        .map(|(i, _)| {
+                            format!("line {}", content[..i].matches('\n').count() + 1)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Ok(ToolResult {
+                        success: false,
+                        output: format!(
+                            "Target content appears MULTIPLE times in {} (at {}) and the declared \
+                             line range {}-{} does not contain it anymore. Refusing to guess: add \
+                             more surrounding context lines to target_content so the match is unique.",
+                            target_file_str, sites, chunk.start_line, chunk.end_line
+                        ),
+                        is_error: true,
+                    });
+                }
+                match first_match {
+                    Some(pos) => pos,
+                    None => {
+                        let actual_preview: String = content.lines().skip(first).take(last - first + 1).collect::<Vec<_>>().join("\n");
+                        return Ok(ToolResult {
+                            success: false,
+                            output: format!(
+                                "Target content chunk not found in file.\nExpected target:\n{:?}\nActual content currently at line {}-{}:\n{}\nPlease check exact characters and match the actual text.",
+                                chunk.target_content, chunk.start_line, chunk.end_line, actual_preview
+                            ),
+                            is_error: true,
+                        });
+                    }
+                }
             };
             content = format!(
                 "{}{}{}",
@@ -933,7 +994,7 @@ impl Tool for RunCommandTool {
         // `output()` future is dropped and `kill_on_drop(true)` reaps the child.
         let run = tokio::select! {
             biased;
-            _ = ctx.cancel.notified() => None,
+            _ = ctx.cancel.cancelled() => None,
             res = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), output_fut) => Some(res),
         };
 
@@ -1432,6 +1493,161 @@ impl Tool for RequestRlmResearchTool {
     }
 }
 
+// 11b. Call RLM Research Tool (handoff: ChatCoordinator -> RLM Model/Verifier)
+pub struct CallRlmResearchTool;
+
+#[async_trait]
+impl Tool for CallRlmResearchTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "call_rlm_research".to_string(),
+            description: "Delegates codebase research to the RLM subagent (RLM Model + Verifier) to explore files, discover symbols, and gather verbatim code snippets into a verified Research Brief.".to_string(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Description of the research need, files, or symbols being investigated"
+                    },
+                    "target_files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of target files or directories to inspect"
+                    }
+                },
+                "required": ["query"]
+            }),
+            requires_approval: false,
+        }
+    }
+
+    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        Ok(ToolResult {
+            success: true,
+            output: "RLM research delegated.".to_string(),
+            is_error: false,
+        })
+    }
+}
+
+// 11c. Call Thinker Direction Tool (handoff: ChatCoordinator -> Thinker)
+pub struct CallThinkerDirectionTool;
+
+#[async_trait]
+impl Tool for CallThinkerDirectionTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "call_thinker_direction".to_string(),
+            description: "Delegates high-level architecture and strategic system design to the Thinker agent (GLM-5.2).".to_string(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "The target goal or feature to design"
+                    },
+                    "research_brief": {
+                        "type": "string",
+                        "description": "Optional research context or facts from RLM to base the architecture upon"
+                    }
+                },
+                "required": ["goal"]
+            }),
+            requires_approval: false,
+        }
+    }
+
+    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        Ok(ToolResult {
+            success: true,
+            output: "Thinker direction delegated.".to_string(),
+            is_error: false,
+        })
+    }
+}
+
+// 11d. Call Planning Swarm Tool (handoff: ChatCoordinator -> Planning Pipeline)
+pub struct CallPlanningSwarmTool;
+
+#[async_trait]
+impl Tool for CallPlanningSwarmTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "call_planning_swarm".to_string(),
+            description: "Delegates full execution planning to the Planning Swarm (Planning Writer ⇄ Plan Reviewer / Plan Editor loop with Plan Approval Gate).".to_string(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "direction": {
+                        "type": "string",
+                        "description": "Architectural direction or guidance for the plan"
+                    },
+                    "user_goal": {
+                        "type": "string",
+                        "description": "The primary user goal to achieve"
+                    }
+                },
+                "required": ["direction", "user_goal"]
+            }),
+            requires_approval: false,
+        }
+    }
+
+    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        Ok(ToolResult {
+            success: true,
+            output: "Planning swarm delegated.".to_string(),
+            is_error: false,
+        })
+    }
+}
+
+// 11e. Call Executor Tool (handoff: ChatCoordinator -> Executor Pipeline)
+pub struct CallExecutorTool;
+
+#[async_trait]
+impl Tool for CallExecutorTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "call_executor".to_string(),
+            description: "Delegates file modifications (code or design) to the Executor pipeline (Executor Code/Design + Executor Reviewer with atomic checkpoints).".to_string(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_kind": {
+                        "type": "string",
+                        "enum": ["code", "design"],
+                        "description": "Type of execution task: code or design"
+                    },
+                    "task_description": {
+                        "type": "string",
+                        "description": "Exact step-by-step description with code anchors"
+                    },
+                    "target_files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of relative file paths from root to modify"
+                    },
+                    "plan_file": {
+                        "type": "string",
+                        "description": "Optional path to plan markdown file (e.g. .kuda/plan/plan.md)"
+                    }
+                },
+                "required": ["task_kind", "task_description"]
+            }),
+            requires_approval: false,
+        }
+    }
+
+    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        Ok(ToolResult {
+            success: true,
+            output: "Executor delegated.".to_string(),
+            is_error: false,
+        })
+    }
+}
+
 // 12. Request External Access Tool (interactive allowlist prompt for out-of-project reads)
 pub struct RequestExternalAccessTool;
 
@@ -1533,7 +1749,7 @@ impl Tool for RequestExternalAccessTool {
                     Ok(false) => false,
                     Err(_) => false,   // sender dropped (run cancelled)
                 },
-                _ = ctx.cancel.notified() => false,          // run cancelled while awaiting
+                _ = ctx.cancel.cancelled() => false,          // run cancelled while awaiting
                 _ = tokio::time::sleep_until(deadline) => false, // shared budget exhausted
             };
             // Regardless of the outcome, drop the stale registry entry so a

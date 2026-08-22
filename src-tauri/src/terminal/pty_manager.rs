@@ -15,6 +15,10 @@ pub struct TerminalOutputPayload {
     pub is_base64: bool,
 }
 
+/// A single PTY-backed terminal session. Cheaply clonable (all state lives
+/// behind `Arc`s) so the multiplexer can clone a handle out of the sessions
+/// map and release the map lock BEFORE doing any blocking PTY I/O.
+#[derive(Clone)]
 pub struct PtySession {
     pub id: String,
     pub master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
@@ -22,7 +26,7 @@ pub struct PtySession {
     /// The spawned shell process. Kept alive so `kill` can terminate it
     /// reliably (removing the session from the map alone leaves a zombie
     /// shell that keeps running).
-    child: Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>,
+    child: Arc<Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>>,
 }
 
 impl PtySession {
@@ -98,7 +102,7 @@ impl PtySession {
             id: session_id,
             master,
             writer,
-            child: Mutex::new(Some(child)),
+            child: Arc::new(Mutex::new(Some(child))),
         })
     }
 

@@ -13,7 +13,7 @@ pub enum MessageRole {
     Tool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ToolCallChunk {
     pub call_id: String,
     pub tool_name: String,
@@ -29,7 +29,7 @@ pub struct StreamUsage {
     pub output_tokens: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Message {
     pub role: MessageRole,
     pub content: String,

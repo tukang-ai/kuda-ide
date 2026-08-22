@@ -65,6 +65,7 @@ const ROLE_META: Record<string, { name: string; color: string }> = {
   executor_reviewer: { name: 'Executor Reviewer', color: '#34d399' },
   rlm_model: { name: 'RLM Model', color: '#22d3ee' },
   rlm_verifier: { name: 'RLM Verifier', color: '#f59e6b' },
+  chat_coordinator: { name: 'Chat Coordinator', color: '#818cf8' },
 };
 
 /// Harga per 1k token per model dari Kuda Hub (in / cache / out).
@@ -560,11 +561,11 @@ export const AgentPanel: React.FC = () => {
   const pendingDirection = useAgent((s) => s.pendingDirection);
   const hasGeminiKey = useAgent((s) => s.hasGeminiKey);
   const showHistory = useAgent((s) => s.showHistory);
-  const swarmMode = useAgent((s) => s.swarmMode);
+  const agentMode = useAgent((s) => s.agentMode);
   const init = useAgent((s) => s.init);
   const setAutoApprove = useAgent((s) => s.setAutoApprove);
   const setPlanGateEnabled = useAgent((s) => s.setPlanGateEnabled);
-  const setSwarmMode = useAgent((s) => s.setSwarmMode);
+  const setAgentMode = useAgent((s) => s.setAgentMode);
   const newChat = useAgent((s) => s.newChat);
   const loadHistory = useAgent((s) => s.loadHistory);
   const deleteSession = useAgent((s) => s.deleteSession);
@@ -670,22 +671,46 @@ export const AgentPanel: React.FC = () => {
                   onClick={() => setMenuOpen(false)}
                 />
                 <div className="agent-header-dropdown">
+                  <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', padding: '4px 8px', letterSpacing: 0.5 }}>
+                    Agent Execution Mode
+                  </div>
                   <button
-                    className={`dropdown-item ${swarmMode ? 'active' : ''}`}
+                    className={`dropdown-item ${agentMode === 'swarm' ? 'active' : ''}`}
                     disabled={busy}
                     onClick={() => {
-                      setSwarmMode(!swarmMode);
+                      setAgentMode('swarm');
                       setMenuOpen(false);
                     }}
-                    title={
-                      swarmMode
-                        ? 'Swarm mode ON: Thinker → Reviewer → Executor Code/Design → Executor Reviewer → Thinker'
-                        : 'Swarm mode OFF: single agent'
-                    }
+                    title="Swarm Mode: Full pipeline otomatis (Thinker → Direction → Planning Writer ⇄ Reviewer → Gate → Executor → Reviewer)"
                   >
-                    <Network size={13} /> Swarm mode
-                    <span className="menu-badge">{swarmMode ? 'ON' : 'OFF'}</span>
+                    <Network size={13} /> Swarm Mode
+                    <span className="menu-badge">{agentMode === 'swarm' ? 'ACTIVE' : ''}</span>
                   </button>
+                  <button
+                    className={`dropdown-item ${agentMode === 'coordinator' ? 'active' : ''}`}
+                    disabled={busy}
+                    onClick={() => {
+                      setAgentMode('coordinator');
+                      setMenuOpen(false);
+                    }}
+                    title="Coordinator Mode: Frontline chat cerdas yang memanggil sub-agent (RLM, Thinker, Planning, Executor) sesuai kebutuhan"
+                  >
+                    <Sparkles size={13} /> Coordinator Mode
+                    <span className="menu-badge">{agentMode === 'coordinator' ? 'ACTIVE' : ''}</span>
+                  </button>
+                  <button
+                    className={`dropdown-item ${agentMode === 'chat' ? 'active' : ''}`}
+                    disabled={busy}
+                    onClick={() => {
+                      setAgentMode('chat');
+                      setMenuOpen(false);
+                    }}
+                    title="Direct Chat: Percakapan langsung single agent cepat"
+                  >
+                    <Bot size={13} /> Direct Chat
+                    <span className="menu-badge">{agentMode === 'chat' ? 'ACTIVE' : ''}</span>
+                  </button>
+                  <div style={{ height: 1, background: 'var(--border-subtle)', margin: '4px 0' }} />
                   <button
                     className={`dropdown-item ${showHistory ? 'active' : ''}`}
                     onClick={() => {
@@ -911,7 +936,9 @@ export const AgentPanel: React.FC = () => {
             disabled={busy}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
+              // `isComposing` guard: pressing Enter to CONFIRM a CJK IME
+              // candidate must not submit the half-composed prompt.
+              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
                 submit();
               }
