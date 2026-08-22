@@ -14,6 +14,8 @@ export interface SearchQuery {
   is_regex: boolean;
   case_sensitive: boolean;
   max_results?: number;
+  /** false = regex mode expands $1/${name} in the replacement; true (default) inserts verbatim */
+  replacement_is_literal?: boolean;
 }
 
 export interface SearchMatch {

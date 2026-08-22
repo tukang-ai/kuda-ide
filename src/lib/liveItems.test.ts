@@ -15,7 +15,7 @@ describe('buildLiveItems', () => {
   it('groups consecutive assistant messages sharing a runId into one run box', () => {
     const items = buildLiveItems([asst('a', 'r1'), asst('b', 'r1')]);
     expect(items).toHaveLength(1);
-    expect(items[0]).toEqual({ type: 'run', runId: 'r1', messages: [asst('a', 'r1'), asst('b', 'r1')] });
+    expect(items[0]).toEqual({ type: 'run', runId: 'r1', groupKey: 'r1#0', messages: [asst('a', 'r1'), asst('b', 'r1')] });
   });
 
   it('keeps user prompts separate and splits runs at user messages', () => {

@@ -19,6 +19,32 @@ pub struct DirEntryItem {
 
 pub struct FileSystemIO;
 
+/// Atomic write (unique tmp -> rename). The tmp name carries a unique suffix so
+/// two concurrent writes to the same file never clobber each other's staging
+/// file. Before the rename, the ORIGINAL file's permissions are copied onto the
+/// staging file — a plain `fs::write` + rename used to reset every restored /
+/// overwritten script to 0644, silently clearing exec bits and ACL-inherited
+/// modes.
+pub fn atomic_write_preserving_permissions(target: &Path, content: &[u8]) -> std::io::Result<()> {
+    let tmp_path = target.with_extension(format!("tmp_write_{}", Uuid::new_v4().simple()));
+    fs::write(&tmp_path, content)?;
+    if let Ok(meta) = fs::metadata(target) {
+        let _ = fs::set_permissions(&tmp_path, meta.permissions());
+        #[cfg(unix)]
+        {
+            // set_permissions covers the mode bits on unix; nothing else to do.
+            let _ = meta;
+        }
+    }
+    match fs::rename(&tmp_path, target) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
 impl FileSystemIO {
     /// Reads file content after verifying path scope against project_root.
     /// Supports optional start_line and end_line (1-indexed, inclusive).
@@ -42,15 +68,40 @@ impl FileSystemIO {
         let full_content = fs::read_to_string(canonical_path)?;
 
         let content = if start_line.is_some() || end_line.is_some() {
-            let lines: Vec<&str> = full_content.lines().collect();
-            let total_lines = lines.len();
-            let start = start_line.unwrap_or(1).saturating_sub(1);
-            let end = end_line.unwrap_or(total_lines).min(total_lines);
+            // Slice on '\n' boundaries but KEEP each line's original
+            // terminator. The old `lines().join("\n")` stripped `\r` from CRLF
+            // files and dropped the trailing-newline bit — any future consumer
+            // writing that text back would silently normalize EOLs.
+            let line_starts: Vec<usize> = {
+                let mut v = vec![0usize];
+                for (i, b) in full_content.bytes().enumerate() {
+                    if b == b'\n' {
+                        v.push(i + 1);
+                    }
+                }
+                v
+            };
+            let total_lines = line_starts.len();
+            let start_idx = start_line.unwrap_or(1).saturating_sub(1);
+            let end_idx = end_line.unwrap_or(total_lines).min(total_lines);
 
-            if start >= total_lines || start >= end {
+            if start_idx >= total_lines || start_idx >= end_idx {
                 String::new()
             } else {
-                lines[start..end].join("\n")
+                let from = line_starts[start_idx];
+                let to = line_starts
+                    .get(end_idx)
+                    .copied()
+                    .unwrap_or(full_content.len());
+                let mut slice = &full_content[from..to];
+                // Mirror the old join(): no newline AFTER the final line.
+                if slice.ends_with('\n') {
+                    slice = &slice[..slice.len() - 1];
+                }
+                if slice.ends_with('\r') {
+                    slice = &slice[..slice.len() - 1];
+                }
+                slice.to_string()
             }
         } else {
             full_content
@@ -95,17 +146,7 @@ impl FileSystemIO {
             None
         };
 
-        // 2. Atomic write (tmp -> rename). The tmp name carries a unique suffix
-        // so two concurrent writes to the same file (two agent runs, or an
-        // agent + a manual save) never clobber each other's staging file — a
-        // shared `foo.tmp_write` used to be overwritten mid-flight and produced
-        // a stale/forked rename.
-        let tmp_path = canonical_path.with_extension(format!(
-            "tmp_write_{}",
-            Uuid::new_v4().simple()
-        ));
-        fs::write(&tmp_path, content)?;
-        fs::rename(&tmp_path, canonical_path)?;
+        atomic_write_preserving_permissions(canonical_path, content.as_bytes())?;
 
         tracing::info!("Successfully wrote file: {:?}", canonical_path);
         Ok(checkpoint)
@@ -139,22 +180,77 @@ impl FileSystemIO {
         agent_message_id: Option<String>,
         session_id: Option<String>,
     ) -> Result<Option<FileCheckpoint>> {
-        let checkpoint = if canonical_path.exists() {
+        Self::write_file_canonical_in_session_checked(
+            canonical_path,
+            content,
+            checkpoint_mgr,
+            agent_message_id,
+            session_id,
+            None,
+        )
+    }
+
+    /// Session-aware write with an OPTIONAL staleness precondition: when
+    /// `expected_source_sha256` is provided and the file already exists on
+    /// disk, its CURRENT content must hash to that value — otherwise someone
+    /// (the agent, another editor window) rewrote it after this client last
+    /// saw it, and blind last-writer-wins would silently destroy their work.
+    pub fn write_file_canonical_in_session_checked(
+        canonical_path: &Path,
+        content: &str,
+        checkpoint_mgr: &CheckpointManager,
+        agent_message_id: Option<String>,
+        session_id: Option<String>,
+        expected_source_sha256: Option<&str>,
+    ) -> Result<Option<FileCheckpoint>> {
+        if canonical_path.exists() {
+            if let (Some(expected), Ok(disk)) =
+                (expected_source_sha256, fs::read(canonical_path))
+            {
+                use sha2::Digest;
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(&disk);
+                let actual = format!("{:x}", hasher.finalize());
+                if !actual.eq_ignore_ascii_case(expected) {
+                    return Err(AppError::General(format!(
+                        "Conflict: '{}' changed on disk since it was loaded. Reload the file, \
+                         reapply your edits, and save again to avoid overwriting someone else's work.",
+                        canonical_path.display()
+                    )));
+                }
+            }
+        }
+        let mut checkpoint = if canonical_path.exists() {
             Some(checkpoint_mgr.create_checkpoint_in_session(
                 canonical_path,
-                agent_message_id,
-                session_id,
+                agent_message_id.clone(),
+                session_id.clone(),
             )?)
         } else {
-            Some(checkpoint_mgr.create_new_file_checkpoint(canonical_path, session_id)?)
+            Some(checkpoint_mgr.create_new_file_checkpoint(
+                canonical_path,
+                session_id.clone(),
+            )?)
         };
 
-        let tmp_path = canonical_path.with_extension(format!(
-            "tmp_write_{}",
-            Uuid::new_v4().simple()
-        ));
-        fs::write(&tmp_path, content)?;
-        fs::rename(&tmp_path, canonical_path)?;
+        // Lost creation race: another writer created the file between our
+        // existence check and now. The "new file" checkpoint has no content
+        // snapshot, so a later revert would DELETE their file — record a real
+        // content checkpoint of THEIR bytes instead.
+        if !checkpoint
+            .as_ref()
+            .map(|c| c.existed_before)
+            .unwrap_or(true)
+            && canonical_path.exists()
+        {
+            checkpoint = Some(checkpoint_mgr.create_checkpoint_in_session(
+                canonical_path,
+                agent_message_id.clone(),
+                session_id.clone(),
+            )?);
+        }
+
+        atomic_write_preserving_permissions(canonical_path, content.as_bytes())?;
 
         tracing::info!("Successfully wrote file: {:?}", canonical_path);
         Ok(checkpoint)

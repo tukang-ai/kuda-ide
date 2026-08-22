@@ -64,8 +64,34 @@ impl LoopbackServer {
                 };
                 let raw = String::from_utf8_lossy(&buf[..n]).to_string();
 
-                let (status, content_type, body_out) = if raw.starts_with("OPTIONS") {
-                    // Preflight CORS & Private Network Access (Chrome 142+ / WebKit).
+                // DNS-rebinding / drive-by defense: this endpoint hands out
+                // account credentials, so only requests addressed to the
+                // loopback interface itself are served.
+                let host_ok = raw
+                    .lines()
+                    .find_map(|l| {
+                        let v = l.strip_prefix("Host:")?.trim();
+                        Some(
+                            v.starts_with("127.0.0.1")
+                                || v.starts_with("localhost")
+                                || v.starts_with("[::1]"),
+                        )
+                    })
+                    .unwrap_or(false);
+
+                let (status, content_type, body_out) = if !host_ok {
+                    (
+                        "403 Forbidden",
+                        "text/html; charset=utf-8",
+                        render_error_html("Forbidden."),
+                    )
+                } else if raw.starts_with("OPTIONS") {
+                    // Preflight: respond EMPTY. No ACAO/ACAPN headers on
+                    // purpose — cross-origin JavaScript must NOT be able to
+                    // read or post here (`ACAO: *` used to let any website in
+                    // any tab inject its own pickup code mid-login). The real
+                    // flow is a top-level browser NAVIGATION to /pickup, which
+                    // needs no CORS at all.
                     ("204 No Content", "text/plain; charset=utf-8", String::new())
                 } else if raw.starts_with("GET /favicon.ico") {
                     // Browser icon request → abaikan tanpa error.
@@ -111,15 +137,8 @@ impl LoopbackServer {
                     ("404 Not Found", "text/html; charset=utf-8", render_error_html("Endpoint tidak ditemukan."))
                 };
 
-                let cors_and_pna = concat!(
-                    "Access-Control-Allow-Origin: *\r\n",
-                    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n",
-                    "Access-Control-Allow-Headers: Content-Type, Access-Control-Request-Private-Network\r\n",
-                    "Access-Control-Allow-Private-Network: true\r\n",
-                    "Access-Control-Max-Age: 86400\r\n"
-                );
                 let resp = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{cors_and_pna}Content-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nCache-Control: no-store\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
                     len = body_out.len(),
                     body = body_out
                 );

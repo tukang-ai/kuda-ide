@@ -12,6 +12,18 @@ pub struct SearchQuery {
     pub is_regex: bool,
     pub case_sensitive: bool,
     pub max_results: Option<usize>,
+    /// When true (the default for literal search mode), the replacement string
+    /// is inserted VERBATIM. When false (regex mode), `$1`/`${name}` group
+    /// references in the replacement are expanded, matching VS Code semantics.
+    /// This flag exists because `regex::replace_all` treats `$` sequences as
+    /// template syntax by default — replacing `cost` with `$100` used to
+    /// silently DELETE every match across the whole workspace.
+    #[serde(default = "default_true")]
+    pub replacement_is_literal: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -88,16 +100,21 @@ impl CodeSearcher {
         Ok(matches)
     }
 
-    /// Replaces every occurrence of `query.pattern` with `replacement` across the
-    /// project (respecting `case_sensitive`), writing each changed file with an
-    /// automatic checkpoint (session-tagged) through the normal atomic write
-    /// path. This powers the Search panel's "Replace All" — the feature used to
-    /// render a dead replace input with no backend at all.
+    /// Replaces every occurrence of `query.pattern` with `replacement` across
+    /// the project (respecting `case_sensitive`), writing each changed file
+    /// with an automatic checkpoint (session-tagged) through the normal atomic
+    /// write path. This powers the Search panel's "Replace All".
+    ///
+    /// `files_filter` restricts the operation to an explicit file set — the
+    /// panel passes the paths visible in its FILTERED result list, so scope /
+    /// include / exclude filters are honored instead of silently rewriting
+    /// every matching file in the workspace.
     pub fn replace(
         query: &SearchQuery,
         replacement: &str,
         project_root: &Path,
         app_data_dir: &Path,
+        files_filter: Option<&[String]>,
     ) -> Result<SearchReplaceResult> {
         let canonical_root = PathGuard::validate_path_in_scope(project_root, project_root)?;
         let re = regex::RegexBuilder::new(&query.pattern)
@@ -123,6 +140,12 @@ impl CodeSearcher {
                 continue;
             }
             let file_path = entry.path().to_path_buf();
+            if let Some(allowed) = files_filter {
+                let fp_str = file_path.to_string_lossy();
+                if !allowed.iter().any(|a| a.as_str() == fp_str.as_ref()) {
+                    continue;
+                }
+            }
             let content = match std::fs::read_to_string(&file_path) {
                 Ok(c) => c,
                 Err(_) => continue, // binary/unreadable files are skipped
@@ -130,7 +153,14 @@ impl CodeSearcher {
             if !re.is_match(&content) {
                 continue;
             }
-            let new_content = re.replace_all(&content, replacement).to_string();
+            // Literal mode inserts the replacement verbatim; `$100` stays
+            // `$100`. Only explicit regex mode expands group references.
+            let new_content = if query.replacement_is_literal {
+                re.replace_all(&content, |_: &regex::Captures| replacement.to_string())
+                    .to_string()
+            } else {
+                re.replace_all(&content, replacement).to_string()
+            };
             if new_content == content {
                 continue;
             }
@@ -173,6 +203,7 @@ mod tests {
             is_regex: false,
             case_sensitive: true,
             max_results: Some(10),
+            replacement_is_literal: true,
         };
 
         let results = CodeSearcher::search(&query, &temp_dir).unwrap();

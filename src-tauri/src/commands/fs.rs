@@ -101,6 +101,7 @@ pub async fn fs_write_file(
     path: String,
     content: String,
     agent_message_id: Option<String>,
+    expected_source_sha256: Option<String>,
 ) -> Result<WriteFileResponse> {
     let app_data = state.require_app_data_dir()?;
     let checkpoint_mgr = CheckpointManager::new(&app_data)?;
@@ -120,12 +121,13 @@ pub async fn fs_write_file(
         }
     }
 
-    let checkpoint = FileSystemIO::write_file_canonical_in_session(
+    let checkpoint = FileSystemIO::write_file_canonical_in_session_checked(
         &canonical,
         &content,
         &checkpoint_mgr,
         agent_message_id,
         None,
+        expected_source_sha256.as_deref(),
     )?;
     Ok(WriteFileResponse {
         path: canonical,

@@ -1,5 +1,4 @@
 use crate::agent::key_store::KeyStore;
-use crate::agent::provider_config::ProviderConfigManager;
 use crate::error::{AppError, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -155,7 +154,10 @@ pub fn has_master_token(app_data_dir: &Path) -> bool {
     if let Some(creds) = HubCredentialStore::load(app_data_dir) {
         return !creds.master_token.is_empty();
     }
-    KeyStore::get_api_key(MASTER_KEY).is_ok()
+    // Keychain-ONLY lookup: the generic `get_api_key` falls back to the
+    // `LLM_API_KEY` env catch-all, which would report an unrelated secret as
+    // a hub login (and then transmit it as the Bearer token on refresh).
+    KeyStore::get_api_key_from_keychain(MASTER_KEY).is_ok()
 }
 
 fn session_expiry(app_data_dir: &Path) -> Option<DateTime<Utc>> {
@@ -212,17 +214,15 @@ pub fn save_hub_credentials(
 /// persists the fresh rotating session key + expiry into the file store (and keychain
 /// mirror). The session key is what the kuda_hub provider uses as its Bearer credential.
 pub async fn refresh_hub_session(app_data_dir: &Path) -> Result<HubSessionInfo> {
-    let base_url = match ProviderConfigManager::load_provider(app_data_dir, "kuda_hub") {
-        Ok(p) => validate_hub_base_url(&p.base_url)?,
-        Err(_) => {
-            return Err(AppError::General(
-                "Kuda Hub provider is not configured".to_string(),
-            ))
-        }
-    };
+    // The refresh call carries the NON-expiring master token as its Bearer
+    // credential, so the destination must NEVER come from renderer-writable
+    // provider config: a compromised webview could retarget `kuda_hub.base_url`
+    // at its own server and extract the permanent token. Every other hub call
+    // (login, usage, pickup) already uses the compiled-in official URL.
+    let base_url = crate::agent::provider_config::HUB_BASE_URL.trim_end_matches('/');
     let master = HubCredentialStore::load(app_data_dir)
         .map(|c| c.master_token)
-        .or_else(|| KeyStore::get_api_key(MASTER_KEY).ok())
+        .or_else(|| KeyStore::get_api_key_from_keychain(MASTER_KEY).ok())
         .filter(|m| !m.is_empty())
         .ok_or_else(|| {
             AppError::General(

@@ -45,6 +45,16 @@ export const SearchPanel: React.FC = () => {
   const runReplace = async () => {
     const q = pattern.trim();
     if (!q || !rawResults || rawResults.length === 0) return;
+    // Only rewrite the files the user actually SEES in the filtered result
+    // list — scope/include/exclude filters used to be ignored and every
+    // matching file in the workspace got modified.
+    const targetFiles = Array.from(
+      new Set((filteredResults ?? []).map((m) => m.file_path)),
+    );
+    if (targetFiles.length === 0) {
+      setSearchError('No files match the current filters — nothing replaced.');
+      return;
+    }
     setSearching(true);
     setSearchError(null);
     try {
@@ -58,8 +68,12 @@ export const SearchPanel: React.FC = () => {
           is_regex: true,
           case_sensitive: caseSensitive,
           max_results: 1000,
+          // Literal search mode must insert `$100` verbatim, not expand it as
+          // a regex template (which silently deleted matches).
+          replacement_is_literal: !isRegex,
         },
         replacePattern,
+        targetFiles,
       );
       setRawResults(null);
       setReplacePattern('');

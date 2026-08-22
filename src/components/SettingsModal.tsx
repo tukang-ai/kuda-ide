@@ -904,36 +904,21 @@ export const SettingsModal: React.FC = () => {
                           const master = hubToken.trim();
                           try {
                             await ipc.agentSaveKey('kuda_hub_master', master);
-                            // Fetch the rotating session key directly from the hub.
+                            // Let the BACKEND perform the refresh: it keeps the
+                            // master token intact and persists only the rotating
+                            // session key. The old frontend fetch wrote
+                            // `token_key` (a session id) into the MASTER slot,
+                            // which broke the next rotation and locked the user
+                            // out after 30 minutes.
                             try {
-                              const r = await fetchWithTimeout(
-                                `${ipc.HUB_BASE_URL}/api/v1/auth/refresh`,
-                                {
-                                  method: 'POST',
-                                  headers: { Authorization: `Bearer ${master}` },
-                                },
-                                6000,
+                              const session = await ipc.agentRefreshHubSession();
+                              setNote(
+                                `Hub token saved! Session aktif sampai ${session.session_expires_at || '30 menit'} dan otomatis diperbarui sebelum habis.`,
                               );
-                              if (r.ok) {
-                                const info = await r.json();
-                                await ipc.agentSaveHubCredentials(
-                                  info.token_key,
-                                  info.session_key,
-                                  info.session_expires_at,
-                                  info.email,
-                                  info.plan_tier,
-                                );
-                                setNote(
-                                  `Hub token saved! Session key (${info.session_key.slice(0, 12)}...) aktif 30 menit dan otomatis diperbarui sebelum habis.`,
-                                );
-                              } else {
-                                const err = await r.json().catch(() => ({}));
-                                setNote(`Token tersimpan, tapi hub menolak refresh: ${err.error || r.status}`);
-                              }
                             } catch {
-                              // Hub offline: simpan token mentah sebagai fallback.
-                              await ipc.agentSaveHubCredentials(master, master, '', '', '');
-                              setNote('Hub server tidak terjangkau; token disimpan sebagai fallback.');
+                              setNote(
+                                'Token tersimpan, tapi hub tidak bisa dihubungi untuk membuat session. Coba lagi saat online.',
+                              );
                             }
                             await checkKey();
                             setHubAccount(await ipc.agentHubAccount().catch(() => null));

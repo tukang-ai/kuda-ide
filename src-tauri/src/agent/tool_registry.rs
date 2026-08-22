@@ -416,6 +416,23 @@ fn line_byte_starts(content: &str) -> Vec<usize> {
 
 /// Byte offset where the chunk's `start_line` begins in `content`. Used only to
 /// order chunks bottom-up so earlier edits never shift later chunks' line numbers.
+/// Normalizes `text`'s line endings to the dominant style of `reference` so a
+/// LF-emitted replacement spliced into a CRLF file does not interleave EOL
+/// styles inside the edited region.
+fn normalize_eol(text: &str, reference: &str) -> String {
+    if text.contains("\r\n") {
+        return text.to_string(); // already authored with CRLF — leave as-is
+    }
+    let total_lf = reference.matches('\n').count();
+    let crlf = reference.matches("\r\n").count();
+    let lf_only = total_lf - crlf;
+    if crlf > lf_only {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_string()
+    }
+}
+
 fn range_start_byte(chunk: &ReplacementChunk, content: &str) -> usize {
     let line_starts = line_byte_starts(content);
     let total = line_starts.len();
@@ -727,6 +744,15 @@ impl Tool for MultiReplaceFileTool {
         });
 
         let mut applied = 0usize;
+        // Byte spans (in CURRENT content coordinates) occupied by text that a
+        // previously-applied chunk INSERTED. A fallback whole-file search must
+        // never land its match inside one of these spans: chunks are applied
+        // bottom-up, so an already-applied (lower) chunk's fresh replacement is
+        // part of `content`, and a stale-ranged higher chunk whose target
+        // happens to appear exactly once INSIDE that inserted code would
+        // otherwise silently corrupt the prior edit instead of touching its own
+        // declared location.
+        let mut inserted_spans: Vec<(usize, usize)> = Vec::new();
         for (_idx, chunk) in indexed {
             if chunk.target_content.is_empty() {
                 return Ok(ToolResult {
@@ -814,12 +840,42 @@ impl Tool for MultiReplaceFileTool {
                     }
                 }
             };
+            // Refuse matches that overlap text inserted by an earlier chunk
+            // (see `inserted_spans`): the unique-match guard cannot detect this
+            // corruption mode on its own.
+            let match_end = abs + chunk.target_content.len();
+            if inserted_spans.iter().any(|&(s, e)| abs < e && s < match_end) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: format!(
+                        "Chunk for lines {}-{} matched text INSIDE a previously applied chunk's \
+                         replacement (byte offset {}). Applying it there would corrupt the earlier \
+                         edit. Re-declare this chunk with the correct current line range.",
+                        chunk.start_line, chunk.end_line, abs
+                    ),
+                    is_error: true,
+                });
+            }
+            // Match the replacement's EOL style to the surrounding file: models
+            // emit `\n`, so splicing verbatim into a CRLF file used to interleave
+            // line endings within one edited region.
+            let replacement_text = normalize_eol(&chunk.replacement_content, range);
             content = format!(
                 "{}{}{}",
                 &content[..abs],
-                chunk.replacement_content,
+                replacement_text,
                 &content[abs + chunk.target_content.len()..]
             );
+            // Shift recorded spans right of the edit point by the length delta,
+            // then record this insertion as protected.
+            let delta = replacement_text.len() as i64 - chunk.target_content.len() as i64;
+            for span in inserted_spans.iter_mut() {
+                if span.0 >= abs {
+                    span.0 = (span.0 as i64 + delta).max(0) as usize;
+                    span.1 = (span.1 as i64 + delta).max(0) as usize;
+                }
+            }
+            inserted_spans.push((abs, abs + replacement_text.len()));
             applied += 1;
         }
 
@@ -1097,6 +1153,7 @@ impl Tool for GrepSearchTool {
             // case-sensitively).
             case_sensitive,
             max_results: Some(max_results),
+            replacement_is_literal: true,
         };
 
         match crate::indexer::search::CodeSearcher::search(&query, &ctx.project_root) {

@@ -638,7 +638,11 @@ export const AgentPanel: React.FC = () => {
 
   const submit = async () => {
     const prompt = input.trim();
-    if (!prompt || busy) return;
+    if (!prompt) return;
+    // Read busy FRESH from the store: the render-captured flag lags one frame
+    // behind send()'s set({busy:true}), and clearing the input before this
+    // check used to silently destroy a second prompt typed in that gap.
+    if (busy || useAgent.getState().busy) return;
     setInput('');
     await send(prompt, () => {
       reloadOpenTabsFromDisk();
@@ -806,7 +810,7 @@ export const AgentPanel: React.FC = () => {
               )}
             </div>
           ) : (
-            <div key={item.runId} className="run-box">
+            <div key={item.groupKey} className="run-box">
               {item.messages.map((m) => <LiveAssistantMessage key={m.id} msg={m} hubPrices={hubPrices} />)}
               {item.messages.some((m) => calcPhasePts(m, hubPrices) > 0) && (
                 <div

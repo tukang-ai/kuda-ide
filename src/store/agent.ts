@@ -100,6 +100,9 @@ interface AgentState {
 let msgCounter = 0;
 const nextId = () => `m${++msgCounter}_${Date.now()}`;
 
+/// Hard cap on the in-memory live transcript (see append sites below).
+const MAX_LIVE_MESSAGES = 800;
+
 // ── Transcript mapping (backend-sent, display-only) ────────────────────────
 // The backend persists every swarm phase as `PhaseRecord[]` in the session
 // file (`ChatSessionData.transcript`). The frontend maps them to the same
@@ -415,6 +418,9 @@ export const useAgent = create<AgentState>((set, get) => ({
   },
 
   newChat: () => {
+    // Switching sessions while a run is streaming would splice the incoming
+    // phase boxes/deltas into the WRONG transcript.
+    if (get().busy) return;
     resetStreamBuffer();
     set({
       activeSessionId: null,
@@ -429,13 +435,17 @@ export const useAgent = create<AgentState>((set, get) => ({
   toggleHistoryPanel: () => set((s) => ({ showHistory: !s.showHistory })),
 
   loadHistory: async (sessionId) => {
+    if (get().busy) return;
     try {
       resetStreamBuffer();
       const data = await ipc.chatLoadSession(sessionId);
       const restored = reconstructHistory(data);
       set({
         activeSessionId: sessionId,
-        historyMessages: data.messages,
+        // Store the RAW ledger for reference only — the panel renders the
+        // RECONSTRUCTED transcript. Rendering both used to show every prompt
+        // twice plus raw `ledger` JSON blobs as assistant cards.
+        historyMessages: [],
         liveMessages: restored,
         error: null,
         showHistory: false,
@@ -447,6 +457,10 @@ export const useAgent = create<AgentState>((set, get) => ({
   },
 
   deleteSession: async (sessionId) => {
+    if (get().busy) {
+      set({ error: 'Cannot delete a session while a run is active.' });
+      return;
+    }
     try {
       await ipc.chatDeleteSession(sessionId);
       const sessions = await ipc.chatListSessions();
@@ -505,7 +519,7 @@ export const useAgent = create<AgentState>((set, get) => ({
         ];
 
     set((s) => ({
-      liveMessages: [...s.liveMessages, ...seedMessages],
+      liveMessages: [...s.liveMessages, ...seedMessages].slice(-MAX_LIVE_MESSAGES),
       pendingExternalRequests: [],
       pendingPlanDecision: null,
       pendingDirection: null,
@@ -520,8 +534,8 @@ export const useAgent = create<AgentState>((set, get) => ({
     const channel = new Channel<AgentEvent>();
     const { wasTouched } = bindRunChannel(channel, runId);
 
+    const currentMode = get().agentMode;
     try {
-      const currentMode = get().agentMode;
       const result =
         currentMode === 'swarm'
           ? await ipc.agentSwarmChat(prompt, activeSessionId, autoApprove, channel, runId)
@@ -543,7 +557,14 @@ export const useAgent = create<AgentState>((set, get) => ({
     } catch (err) {
       set((s) => ({
         error: String(err),
-        resumeTarget: { sessionId: s.activeSessionId ?? '', runId },
+        // Resume replays from checkpoints, which ONLY swarm runs produce.
+        // Offering "Jalankan ulang bagian akhir" after a direct-chat failure
+        // guaranteed an error; and an empty sessionId made the backend fork a
+        // brand-new session instead of continuing this one.
+        resumeTarget:
+          currentMode === 'swarm' && s.activeSessionId
+            ? { sessionId: s.activeSessionId, runId }
+            : null,
         liveMessages: s.liveMessages.map((m) => ({ ...m, streaming: false })),
       }));
     } finally {
@@ -557,7 +578,8 @@ export const useAgent = create<AgentState>((set, get) => ({
     const target = overrideRunId
       ? { sessionId: get().activeSessionId ?? '', runId: overrideRunId }
       : get().resumeTarget;
-    if (!target || get().busy) return;
+    // An empty sessionId would make the backend fork a brand-new session.
+    if (!target || !target.sessionId || get().busy) return;
     set({
       error: null,
       pendingExternalRequests: [],
@@ -575,9 +597,10 @@ export const useAgent = create<AgentState>((set, get) => ({
         activeSessionId: result.chat_session_id,
         lastEditSessionId: result.edit_session_id,
         resumeTarget: null,
-        liveMessages: s.liveMessages.map((m) =>
-          m.editSessionId === result.edit_session_id ? { ...m, streaming: false } : m,
-        ),
+        // Clear streaming on EVERY message: only user bubbles carry
+        // editSessionId, so the old targeted map never matched its targets and
+        // relied entirely on the Finished event arriving to settle the flags.
+        liveMessages: s.liveMessages.map((m) => ({ ...m, streaming: false })),
       }));
       try {
         const sessions = await ipc.chatListSessions();
@@ -609,9 +632,16 @@ export const useAgent = create<AgentState>((set, get) => ({
     const target = sessionId ?? get().lastEditSessionId;
     if (!target) return;
     try {
-      const reverted = await ipc.historyRevertSession(target);
-      if (reverted.length === 0) {
+      const result = await ipc.historyRevertSession(target);
+      if (result.reverted.length === 0 && result.failed.length === 0) {
         alert('Nothing to revert: this run did not edit any files.');
+      } else if (result.failed.length > 0) {
+        // Partial failure: some files rolled back, some could not. Never let
+        // this look like a clean abort — the user must know the tree state.
+        alert(
+          `Reverted ${result.reverted.length} file(s), but ${result.failed.length} file(s) FAILED to revert:\n\n` +
+            result.failed.join('\n'),
+        );
       }
       set((s) => ({
         lastEditSessionId: s.lastEditSessionId === target ? null : s.lastEditSessionId,
@@ -626,6 +656,13 @@ export const useAgent = create<AgentState>((set, get) => ({
   },
 
   approveExternalAccess: async (requestId) => {
+    // Remove the request up front so a double-click can't invoke resolve twice
+    // (the second call used to reject with "unknown request" into the banner).
+    set((s) => ({
+      pendingExternalRequests: s.pendingExternalRequests.filter(
+        (r) => r.requestId !== requestId,
+      ),
+    }));
     try {
       await ipc.agentApproveExternalAccess(requestId);
     } catch (err) {
@@ -634,6 +671,11 @@ export const useAgent = create<AgentState>((set, get) => ({
   },
 
   denyExternalAccess: async (requestId) => {
+    set((s) => ({
+      pendingExternalRequests: s.pendingExternalRequests.filter(
+        (r) => r.requestId !== requestId,
+      ),
+    }));
     try {
       await ipc.agentDenyExternalAccess(requestId);
     } catch (err) {
@@ -644,6 +686,10 @@ export const useAgent = create<AgentState>((set, get) => ({
   resolvePlanDecision: async (decision, note) => {
     const pending = get().pendingPlanDecision;
     if (!pending) return;
+    // Clear the gate IMMEDIATELY: a double-click used to fire a second invoke
+    // against an already-resolved request id, surfacing a spurious error
+    // banner even though the first (successful) resolution continued the run.
+    set((s) => ({ pendingPlanDecision: s.pendingPlanDecision?.requestId === pending.requestId ? null : s.pendingPlanDecision }));
     try {
       await ipc.agentResolvePlanDecision(pending.requestId, decision, note);
     } catch (err) {
@@ -654,6 +700,7 @@ export const useAgent = create<AgentState>((set, get) => ({
   resolveDirection: async (decision, note) => {
     const pending = get().pendingDirection;
     if (!pending) return;
+    set((s) => ({ pendingDirection: s.pendingDirection?.requestId === pending.requestId ? null : s.pendingDirection }));
     try {
       await ipc.agentResolveDirectionDecision(pending.requestId, decision, note);
     } catch (err) {
@@ -771,7 +818,11 @@ function bindRunChannel(
         );
         return {
           liveMessages: [
-            ...previous,
+            // Hard cap: a long multi-run session used to grow the store
+            // unboundedly (every phase box + full tool output kept forever in
+            // the webview). Keep the most recent window; finished sessions
+            // remain recoverable via Chat history.
+            ...previous.slice(Math.max(0, previous.length - MAX_LIVE_MESSAGES + 1)),
             {
               id: nextId(),
               role: 'assistant',

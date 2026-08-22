@@ -71,10 +71,21 @@ interface ContextMenuState {
 }
 
 export const FileExplorer: React.FC = () => {
-  const {
-    projectRoot, projectName, expandedDirs, dirEntries, loadingDirs,
-    activePath, toggleDir, refreshDir, reloadAllExpanded, openFile, closeTab, setActive,
-  } = useWorkspace();
+  // Narrow selectors: the previous bare `useWorkspace()` subscribed to the
+  // WHOLE store, so every editor keystroke (updateContent → tabs change)
+  // re-rendered the entire recursive tree.
+  const projectRoot = useWorkspace((s) => s.projectRoot);
+  const projectName = useWorkspace((s) => s.projectName);
+  const expandedDirs = useWorkspace((s) => s.expandedDirs);
+  const dirEntries = useWorkspace((s) => s.dirEntries);
+  const loadingDirs = useWorkspace((s) => s.loadingDirs);
+  const activePath = useWorkspace((s) => s.activePath);
+  const toggleDir = useWorkspace((s) => s.toggleDir);
+  const refreshDir = useWorkspace((s) => s.refreshDir);
+  const reloadAllExpanded = useWorkspace((s) => s.reloadAllExpanded);
+  const openFile = useWorkspace((s) => s.openFile);
+  const closeTab = useWorkspace((s) => s.closeTab);
+  const setActive = useWorkspace((s) => s.setActive);
   const [creating, setCreating] = useState<CreatingState | null>(null);
   const [newName, setNewName] = useState('');
   const [renaming, setRenaming] = useState<RenamingState | null>(null);
@@ -151,6 +162,18 @@ export const FileExplorer: React.FC = () => {
       return;
     }
     const newPath = `${renaming.parentPath}/${renameValue.trim()}`;
+    // Resolve the unsaved-changes question BEFORE touching disk: after the
+    // rename completes, cancelling the confirm used to leave a tab pointing
+    // at the old path whose save would resurrect a stale file.
+    const tab = useWorkspace.getState().tabs.find((t) => t.path === renaming.path);
+    if (tab && tab.content !== tab.savedContent) {
+      if (
+        !confirm(`"${renaming.oldName}" has unsaved changes. Rename anyway and discard them?`)
+      ) {
+        setRenaming(null);
+        return;
+      }
+    }
     try {
       await ipc.fsRename(renaming.path, newPath);
       await refreshDir(renaming.parentPath);
@@ -163,6 +186,12 @@ export const FileExplorer: React.FC = () => {
 
   const handleDelete = async (entry: DirEntryItem) => {
     if (!confirm(`Move "${entry.name}" to Trash?`)) return;
+    // Same ordering as rename: settle dirty-tab state before the destructive
+    // disk operation, not after.
+    const tab = useWorkspace.getState().tabs.find((t) => t.path === entry.path);
+    if (tab && tab.content !== tab.savedContent) {
+      if (!confirm(`"${entry.name}" has unsaved changes. Delete anyway?`)) return;
+    }
     try {
       await ipc.fsDelete(entry.path);
       const parent = entry.path.slice(0, entry.path.lastIndexOf('/')) || projectRoot;

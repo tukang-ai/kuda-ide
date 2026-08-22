@@ -130,6 +130,9 @@ _RLM_GUARD_INTERNALS = {
     'path_open': pathlib.Path.open,
     'realpath': os.path.realpath,
     'stat': os.stat,
+    'access': getattr(os, 'access', None),
+    'close': os.close,
+    'dup2': getattr(os, 'dup2', None),
     'import': builtins.__import__,
     'sys': _sys,
     'path_probes': {pn: getattr(os.path, pn) for pn in ('exists', 'isfile', 'isdir', 'lexists', 'islink', 'getsize', 'getatime', 'getmtime', 'getctime') if hasattr(os.path, pn)},
@@ -199,6 +202,13 @@ def _rlm_install_guard():
 
     # Replace the inherited (secret-bearing) environment with a sanitized copy.
     os.environ = {k: v for k, v in _orig_env.items() if k in _RLM_ENV_ALLOW}
+    # `os.environb` is a SEPARATE mapping mirroring the raw C environ — leaving
+    # it untouched hands back every secret the dict replacement just removed.
+    try:
+        os.environb = {k.encode('utf-8', 'surrogateescape'): v.encode('utf-8', 'surrogateescape')
+                       for k, v in os.environ.items()}
+    except Exception:
+        pass
 
     def _rlm_real(path):
         # `_orig_realpath` is the original posixpath.realpath. NOTE: realpath
@@ -305,10 +315,58 @@ def _rlm_install_guard():
         if _pn in _orig_path_probes:
             setattr(os.path, _pn, _make_safe_probe(_pn, _orig_path_probes[_pn]))
 
+    # `os.access('/etc', R_OK) -> True` leaks out-of-scope metadata verdicts;
+    # answer False for anything outside scope instead of delegating.
+    _orig_access = _RLM_GUARD_INTERNALS.get('access')
+    if _orig_access is not None:
+        def _safe_access(path, mode, *a, **k):
+            if not _rlm_in_scope(path):
+                return False
+            return _orig_access(path, mode, *a, **k)
+        os.access = _safe_access
+
     for _f in ['remove', 'unlink', 'rmdir', 'mkdir', 'makedirs', 'rename', 'renames', 'replace', 'write', 'truncate', 'chmod', 'chown', 'system',
-               'kill', 'killpg', 'abort', '_exit', 'setsid', 'setuid', 'setgid', 'chroot', 'sethostname']:
+               'kill', 'killpg', 'abort', '_exit', 'setsid', 'setuid', 'setgid', 'chroot', 'sethostname',
+               # Directory-entry creation primitives: none of these emit audit
+               # events, and a hardlink/symlink planted inside the (allowlisted)
+               # scratch dir defeats path-based scope checks entirely.
+               'link', 'symlink', 'mkfifo', 'mknod', 'mkdtemp',
+               'linkat', 'symlinkat', 'mkfifoat', 'mknodat', 'renameat', 'mkdirat',
+               # Process-state mutators: ftruncate is a write primitive, the env
+               # helpers mutate the REAL C environ behind the sanitized mapping,
+               # umask changes side effects for the whole process, dup2 can
+               # redirect stdio and break the kernel's sentinel protocol.
+               'ftruncate', 'putenv', 'unsetenv', 'umask']:
         if hasattr(os, _f):
             setattr(os, _f, _block_mutation(_f))
+
+    # os.dup2 targeting stdio breaks the sentinel protocol; other targets are
+    # harmless but pointless — refuse stdio redirection outright. The original
+    # comes from `_RLM_GUARD_INTERNALS` so re-installs never stack wrappers.
+    _orig_dup2 = _RLM_GUARD_INTERNALS.get('dup2')
+    if _orig_dup2 is not None:
+        def _safe_dup2(src_fd, dst_fd, *a, **k):
+            if dst_fd in (0, 1, 2) or src_fd in (0, 1, 2):
+                raise ReadOnlyError("RLM Kernel AUDIT: dup2 involving stdio fd %r->%r is blocked." % (src_fd, dst_fd))
+            return _orig_dup2(src_fd, dst_fd, *a, **k)
+        os.dup2 = _safe_dup2
+
+    # Closing fd 0/1/2 kills the REPL protocol (stderr sentinel never arrives,
+    # every later call burns its full timeout). Refuse stdio close specifically;
+    # internal error paths use `_rlm_orig_close` directly. NOTE: the original is
+    # taken from `_RLM_GUARD_INTERNALS` (captured once at guard load) — reading
+    # `os.close` here would capture this very wrapper on a re-install.
+    _rlm_orig_close = _RLM_GUARD_INTERNALS['close']
+
+    def _safe_close(fd):
+        try:
+            fd_int = int(fd)
+        except (TypeError, ValueError):
+            raise ReadOnlyError("RLM Kernel AUDIT: os.close(%r) refused." % (fd,))
+        if fd_int in (0, 1, 2):
+            raise ReadOnlyError("RLM Kernel AUDIT: closing stdio fd %d is blocked." % fd_int)
+        return _rlm_orig_close(fd)
+    os.close = _safe_close
 
     for _f in ['rmtree', 'move', 'copy', 'copy2', 'copyfile', 'copystat', 'copymode']:
         if hasattr(shutil, _f):
@@ -362,11 +420,19 @@ def _rlm_install_guard():
             if any(_c in _m for _c in ('w', 'a', '+', 'x')):
                 raise ReadOnlyError("RLM Kernel is READ-ONLY: io.FileIO write mode blocked.")
             _sn = name.decode('utf-8', 'replace') if isinstance(name, bytes) else str(name)
-            if _rlm_is_denied(_sn):
+            # Resolve symlinks BEFORE applying the source-suffix exemption:
+            # otherwise `scratch/evil.py -> ~/Documents/notes.txt` inherits
+            # source-file status from its NAME while reading arbitrary bytes.
+            try:
+                _rp = _rlm_real(_sn)
+            except Exception:
+                _rp = None
+            _check = _rp if _rp else _sn
+            if _rlm_is_denied(_sn) or _rlm_is_denied(_check):
                 raise ReadOnlyError("RLM Kernel SECURITY: io.FileIO denied path: '%s'" % (_sn,))
-            if not _sn.lower().endswith(('.py', '.pyc', '.pyo', '.pyd')):
-                if not _rlm_in_scope(name):
-                    raise ReadOnlyError("RLM Kernel READ BLOCKED_EXTERNAL: io.FileIO outside scope: '%s'" % (name,))
+            if not _check.lower().endswith(('.py', '.pyc', '.pyo', '.pyd')):
+                if not _rlm_in_scope(_check):
+                    raise ReadOnlyError("RLM Kernel READ BLOCKED_EXTERNAL: io.FileIO outside scope: '%s'" % (_sn,))
             return _orig_file_io(name, _m, *args, **kwargs)
         _io.FileIO = _safe_file_io
 
@@ -379,10 +445,17 @@ def _rlm_install_guard():
     if _orig_open_code is not None:
         def _safe_open_code(path):
             _s = path.decode('utf-8', 'replace') if isinstance(path, bytes) else str(path)
-            if _rlm_is_denied(_s):
+            # Same symlink-first resolution as `_safe_file_io`: the suffix
+            # exemption must key on what the open actually READS.
+            try:
+                _rp = _rlm_real(_s)
+            except Exception:
+                _rp = None
+            _check = _rp if _rp else _s
+            if _rlm_is_denied(_s) or _rlm_is_denied(_check):
                 raise ReadOnlyError("RLM Kernel SECURITY: io.open_code denied path: '%s'" % (_s,))
-            if not _s.lower().endswith(('.py', '.pyc', '.pyo', '.pyd')):
-                if not _rlm_in_scope(_s):
+            if not _check.lower().endswith(('.py', '.pyc', '.pyo', '.pyd')):
+                if not _rlm_in_scope(_check):
                     raise ReadOnlyError("RLM Kernel READ BLOCKED_EXTERNAL: io.open_code outside scope: '%s'" % (_s,))
             return _orig_open_code(path)
         _io.open_code = _safe_open_code
@@ -469,7 +542,13 @@ def _rlm_install_guard():
     # `sqlite3`/`dbm`/`shelve` open files through their own C code, entirely
     # outside the patched `open`/`os.open` — sqlite3.connect can even CREATE
     # files (write primitive), so the whole family is refused.
-    for _m in ['ctypes', 'cffi', 'socket', 'pty', 'fcntl', 'posix', '_posixsubprocess',
+    # `_ctypes`/`_cffi_backend` are the C cores behind ctypes/cffi: poisoning
+    # only the pure-Python wrappers leaves `import _ctypes;
+    # _ctypes.dlopen(...)` wide open, which is a full guard bypass. `mmap`
+    # exposes raw memory/file mapping; `_winapi` is the Windows process
+    # primitive surface.
+    for _m in ['ctypes', 'cffi', '_ctypes', '_cffi_backend', 'mmap', '_winapi',
+               'socket', 'pty', 'fcntl', 'posix', '_posixsubprocess',
                'gc', 'inspect', 'sqlite3', 'dbm', 'shelve']:
         _sys.modules[_m] = None
 
@@ -546,39 +625,56 @@ _rlm_audit_state = {}
 def _rlm_audit_hook(event, args):
     st = _rlm_audit_state
     chk_in = st.get('in_scope')
-    if chk_in is None:
-        return  # guard not initialized yet — only trusted bootstrap runs here
+    deny = st.get('is_denied')
+    if chk_in is None or deny is None:
+        # FAIL-CLOSED: no trusted checker installed yet. This is only legitimate
+        # during the initial bootstrap window (before the first
+        # `_rlm_install_guard()` populates the state). Instead of silently
+        # allowing everything (fail-open), only genuine Python source reads may
+        # pass — anything else, and any later "state went missing" situation
+        # caused by tampering, is refused outright.
+        if event in ('open', 'open_code'):
+            target = args[0] if args else None
+            if isinstance(target, int):
+                return  # fd-based open; fds originate only from the guarded os.open
+            _s = target.decode('utf-8', 'replace') if isinstance(target, bytes) else str(target)
+            mode = args[1] if len(args) > 1 and event == 'open' else ''
+            m = mode if isinstance(mode, str) else ''
+            if m and any(flag in m for flag in ('w', 'a', '+', 'x')):
+                raise ReadOnlyError("RLM Kernel AUDIT: write-mode open before guard init: %r" % _s)
+            try:
+                rp0 = str(os.path.realpath(_s))
+            except Exception:
+                rp0 = _s
+            if rp0.lower().endswith(('.py', '.pyc', '.pyo', '.pyd')):
+                return
+        raise ReadOnlyError("RLM Kernel AUDIT: guard not initialized; refusing '%s' (fail-closed)." % event)
     if event == 'open' or event == 'open_code':
         target = args[0] if args else None
         if isinstance(target, int):
             return  # fd-based open; fds originate only from the guarded os.open
         if isinstance(target, bytes):
             target = target.decode('utf-8', 'replace')
-        deny = st.get('is_denied')
         # Write modes are blocked EVERYWHERE, no exceptions.
         mode = args[1] if len(args) > 1 and event == 'open' else ''
         m = mode if isinstance(mode, str) else ''
         if m and any(flag in m for flag in ('w', 'a', '+', 'x')):
             raise ReadOnlyError("RLM Kernel AUDIT: write-mode open is blocked: %r" % (target,))
-        # Denylist applies to every path, raw string first.
-        _s = str(target)
-        if deny is not None and deny(_s):
-            raise ReadOnlyError("RLM Kernel AUDIT SECURITY: '%s' is a sensitive path." % _s)
-        # Python source/bytecode files may legitimately live OUTSIDE the
-        # project scope: stdlib/site-packages IMPORTS read them from anywhere
-        # on sys.path, and some loader paths go straight to the raw syscall
-        # (bypassing every Python-level wrapper), so this hook is the only
-        # enforcement point. Read-only access to genuine source suffixes is
-        # allowed; everything else must pass the full canonical scope check.
-        if not _s.lower().endswith(('.py', '.pyc', '.pyo', '.pyd')):
-            try:
-                rp = os.path.realpath(target)
-            except Exception:
-                rp = _s
+        # Resolve FIRST: the source-suffix exemption must key on what the open
+        # actually READS, not on the caller-chosen spelling — otherwise a
+        # symlink named `x.py` pointing at an arbitrary file inherits
+        # source-file status from its name alone.
+        try:
+            rp = str(os.path.realpath(target))
+        except Exception:
+            rp = str(target)
+        # Denylist on both spellings (raw catches `.env*` basename rules on the
+        # link itself; resolved catches links INTO sensitive directories).
+        if deny(str(target)) or deny(rp):
+            raise ReadOnlyError("RLM Kernel AUDIT SECURITY: '%s' is a sensitive path." % rp)
+        if not rp.lower().endswith(('.py', '.pyc', '.pyo', '.pyd')):
             if not chk_in(rp):
                 raise ReadOnlyError("RLM Kernel AUDIT BLOCKED_EXTERNAL: '%s' is outside the allowed scope." % rp)
-            if deny is not None and deny(rp):
-                raise ReadOnlyError("RLM Kernel AUDIT SECURITY: '%s' is a sensitive path." % rp)
     elif event in ('os.system', 'subprocess.Popen', 'os.exec', 'os.posix_spawn',
                    'os.posix_spawnp', 'os.fork', 'os.forkpty',
                    'socket.connect', 'socket.bind'):
@@ -598,7 +694,31 @@ if hasattr(_sys, 'addaudithook'):
 /// or sub-second mutations never serve stale content.
 const MEMO_PY: &str = r#"
 import hashlib, time
-_rlm_index = {}
+
+# The memo store deliberately does NOT expose __setitem__/update: helper
+# functions resolve `_rlm_index` through their (introspectable) globals, so a
+# plain dict would let model code overwrite cache entries via
+# `_rlm_load.__globals__['_rlm_index'][key] = {...}` and inject arbitrary
+# content into the agent's context. Method-based mutation raises the bar far
+# above the one-line poisoning primitive.
+class _rlm_MemoStore:
+    __slots__ = ('_d',)
+    def __init__(self):
+        object.__setattr__(self, '_d', {})
+    def get(self, key, default=None):
+        return self._d.get(key, default)
+    def put(self, key, value):
+        self._d[key] = value
+    def pop(self, key, default=None):
+        return self._d.pop(key, default)
+    def clear(self):
+        self._d.clear()
+    def __contains__(self, key):
+        return key in self._d
+    def __len__(self):
+        return len(self._d)
+
+_rlm_index = _rlm_MemoStore()
 
 def _rlm_load(path):
     if not _rlm_in_scope(path):
@@ -634,7 +754,7 @@ def _rlm_load(path):
         entry['size'] = size
         return entry['content']
 
-    _rlm_index[key] = {
+    _rlm_index.put(key, {
         'ino': ino,
         'dev': dev,
         'size': size,
@@ -643,14 +763,14 @@ def _rlm_load(path):
         'sha': sha,
         'content': content,
         'loaded_at': time.time(),
-    }
+    })
     return content
 
 def _rlm_forget(path=None):
     if path is None:
         _rlm_index.clear()
     else:
-        _rlm_index.pop(os.path.realpath(path), None)
+        _rlm_index.pop(os.path.realpath(path))
 "#;
 
 /// Compact read helpers: `_rlm_symbols`, `_rlm_grep`, `_rlm_snippet`. All three
@@ -773,8 +893,43 @@ def _rlm_snippet(path, start, end):
 # It captures regions here (kernel keeps the exact bytes) and writes
 # `[SNIPPET id="N"]` placeholders; the swarm expands them into verbatim
 # `--- path [start-end]` blocks before the brief reaches the Thinker.
-_rlm_snippet_seq = [0]
-_rlm_bank = {}
+# Same encapsulation rule as `_rlm_MemoStore`: no __setitem__ on the exposed
+# object, so `_rlm_capture.__globals__['_rlm_bank'][id] = {...}` poisoning
+# fails with TypeError instead of injecting attacker content into the brief.
+class _rlm_BankStore:
+    __slots__ = ('_d',)
+    def __init__(self):
+        object.__setattr__(self, '_d', {})
+    def get(self, key, default=None):
+        return self._d.get(key, default)
+    def put(self, key, value):
+        self._d[key] = value
+    def items(self):
+        return self._d.items()
+    def keys(self):
+        return self._d.keys()
+    def __getitem__(self, key):
+        return self._d[key]
+    def __contains__(self, key):
+        return key in self._d
+    def __iter__(self):
+        return iter(self._d)
+    def __len__(self):
+        return len(self._d)
+    def __bool__(self):
+        return bool(self._d)
+
+class _rlm_Counter:
+    __slots__ = ('_n',)
+    def __init__(self):
+        object.__setattr__(self, '_n', 0)
+    def next_id(self):
+        n = self._n + 1
+        object.__setattr__(self, '_n', n)
+        return n
+
+_rlm_snippet_seq = _rlm_Counter()
+_rlm_bank = _rlm_BankStore()
 
 def _rlm_capture(path, start=1, end=None, label=''):
     if not _rlm_in_scope(path):
@@ -803,10 +958,9 @@ def _rlm_capture(path, start=1, end=None, label=''):
         return '(no lines at %s starting %d)' % (_rlm_rel(path), start)
     content = '\n'.join(lines)
     eff_end = end if end is not None else start + len(lines) - 1
-    _rlm_snippet_seq[0] += 1
-    sid = _rlm_snippet_seq[0]
-    _rlm_bank[sid] = {'rel': _rlm_rel(path), 'path': os.path.realpath(path),
-                      'start': start, 'end': eff_end, 'content': content}
+    sid = _rlm_snippet_seq.next_id()
+    _rlm_bank.put(sid, {'rel': _rlm_rel(path), 'path': os.path.realpath(path),
+                        'start': start, 'end': eff_end, 'content': content})
     return 'CAPTURED id=%d %s [%d-%d] (%d chars)%s' % (
         sid, _rlm_rel(path), start, eff_end, len(content),
         (' — ' + label) if label else '')
@@ -846,14 +1000,28 @@ def _rlm_snippet_block(sid):
 /// Created with mode 0700 so other local users cannot read staged snippets
 /// (which may contain project source) before they are removed.
 fn rlm_scratch_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("kuda_rlm_scratch");
-    let _ = std::fs::create_dir_all(&dir);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    }
-    dir
+    // Unique per IDE process (created exactly once): a fixed name lets a local
+    // attacker pre-create the directory before launch (keeping ownership
+    // despite the 0700 fixup) and swap staged `cmd_<uuid>.py` files between
+    // staging and the kernel's guarded read — injecting code into the TRUSTED
+    // execute path. The unguessable uuid suffix closes that race.
+    static SCRATCH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    SCRATCH
+        .get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "kuda_rlm_scratch_{}_{}",
+                std::process::id(),
+                Uuid::new_v4().simple()
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+            dir
+        })
+        .clone()
 }
 
 /// Writes `code` to a 0600 scratch file staged for `exec` (never world-readable,
@@ -914,7 +1082,14 @@ pub struct RlmKernelProcess {
 impl RlmKernelProcess {
     pub async fn spawn(project_root: &Path, allowlist: &[PathBuf]) -> Result<Self> {
         let mut cmd = tokio::process::Command::new("python3");
-        cmd.args(["-u", "-i", "-q"])
+        // `-I` (isolated mode) is CRITICAL here: without it sys.path[0] is the
+        // project root, so any file named like a bootstrap import
+        // (`base64.py`, `time.py`, ...) planted in the project root executes
+        // with FULL privileges before the read-only guard even exists.
+        // `-I` also ignores PYTHONSTARTUP/usercustomize/PYTHONPATH, killing
+        // those pre-guard execution vectors too. `-u` keeps the sentinel
+        // protocol unbuffered regardless of PYTHONUNBUFFERED being ignored.
+        cmd.args(["-I", "-u", "-i", "-q"])
             .current_dir(project_root)
             .kill_on_drop(true)
             .stdin(Stdio::piped())
@@ -1013,7 +1188,21 @@ impl RlmKernelProcess {
     /// read the allowlist/root from their closure (see `_rlm_install_guard`), so
     /// even a leaked reference cannot rebind what the checks consult.
     pub async fn execute_user_code(&mut self, code: &str, timeout_secs: u64) -> Result<String> {
-        let (file_path, path_b64, uuid) = self.stage_code(code)?;
+        // `raise SystemExit(0)` inside model code would kill the persistent
+        // kernel process mid-session (a cheap availability attack — every
+        // respawn resets all memo/bank state). Wrap the snippet so SystemExit
+        // is swallowed at the exec boundary; the kernel stays alive.
+        let indented = code
+            .lines()
+            .map(|l| format!("    {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let wrapped_code = if code.trim().is_empty() {
+            code.to_string()
+        } else {
+            format!("try:\n{indented}\nexcept SystemExit:\n    pass\n")
+        };
+        let (file_path, path_b64, uuid) = self.stage_code(&wrapped_code)?;
         let stdout_sentinel = format!("---RLM_STDOUT_{}---", uuid);
         let stderr_sentinel = format!("---RLM_STDERR_{}---", uuid);
         let user_names = RLM_USER_NAMESPACE_NAMES

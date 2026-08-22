@@ -1798,7 +1798,7 @@ impl SwarmOrchestrator {
                     if let Some(parent) = canon.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    let _ = std::fs::write(&canon, &plan_md);
+                    let _ = crate::file_system::io::atomic_write_preserving_permissions(&canon, plan_md.as_bytes());
                 }
                 emit(AgentEventKind::PlanDecisionRequest {
                     request_id: request_id.clone(),
@@ -3466,7 +3466,7 @@ impl SwarmOrchestrator {
         if let Some(parent) = plan_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&plan_path, &plan_md);
+        let _ = crate::file_system::io::atomic_write_preserving_permissions(&plan_path, plan_md.as_bytes());
 
         ledger.plan_markdown = Some(truncate_chars(&plan_md, LEDGER_PLAN_CHARS));
         ledger.plan_status = Some("approved".to_string());
@@ -3922,7 +3922,7 @@ pub(crate) fn handoff_doc(project_root: &Path, args_json: &str, fallback_text: &
             if let Some(parent) = canon.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(&canon, content.as_bytes());
+            let _ = crate::file_system::io::atomic_write_preserving_permissions(&canon, content.as_bytes());
         }
     }
     Ok(content)
@@ -3942,7 +3942,7 @@ fn persist_handoff_artifact(project_root: &Path, args_json: &str, content: &str)
         if let Some(parent) = canon.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&canon, content.as_bytes());
+        let _ = crate::file_system::io::atomic_write_preserving_permissions(&canon, content.as_bytes());
     }
 }
 

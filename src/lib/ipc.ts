@@ -47,8 +47,24 @@ export const fsWriteFile = (
   path: string,
   content: string,
   agentMessageId?: string,
+  expectedSourceSha256?: string,
 ): Promise<WriteFileResponse> =>
-  invoke<WriteFileResponse>('fs_write_file', { path, content, agentMessageId });
+  invoke<WriteFileResponse>('fs_write_file', {
+    path,
+    content,
+    agentMessageId,
+    expectedSourceSha256,
+  });
+
+/** SHA-256 hex digest of a UTF-8 string (WebCrypto) — used as the staleness
+ * precondition for editor saves. */
+export async function sha256Hex(text: string): Promise<string> {
+  const bytes = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
 
 export const fsDelete = (path: string): Promise<void> =>
   invoke<void>('fs_delete', { path });
@@ -106,8 +122,9 @@ export interface SearchReplaceResult {
 export const searchReplace = (
   query: SearchQuery,
   replacement: string,
+  files?: string[],
 ): Promise<SearchReplaceResult> =>
-  invoke<SearchReplaceResult>('search_replace', { query, replacement });
+  invoke<SearchReplaceResult>('search_replace', { query, replacement, files });
 
 export const parseSymbols = (path: string): Promise<CodeSymbol[]> =>
   invoke<CodeSymbol[]>('parse_symbols', { path });
@@ -339,8 +356,13 @@ export const historyListCheckpoints = (): Promise<FileCheckpoint[]> =>
 export const historyListSessions = (): Promise<SessionInfo[]> =>
   invoke<SessionInfo[]>('history_list_sessions');
 
-export const historyRevertSession = (sessionId: string): Promise<string[]> =>
-  invoke<string[]>('history_revert_session', { sessionId });
+export interface RevertSessionResult {
+  reverted: string[];
+  failed: string[];
+}
+
+export const historyRevertSession = (sessionId: string): Promise<RevertSessionResult> =>
+  invoke<RevertSessionResult>('history_revert_session', { sessionId });
 
 export const historyRestoreCheckpoint = (checkpointId: string): Promise<string> =>
   invoke<string>('history_restore_checkpoint', { checkpointId });

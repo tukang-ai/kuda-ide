@@ -98,11 +98,15 @@ pub async fn agent_hub_user_usage(
     let base_url = crate::agent::provider_config::HUB_BASE_URL.trim_end_matches('/');
     let url = format!("{}/user/usage", base_url);
 
-    let token = if !creds.master_token.is_empty() {
-        &creds.master_token
-    } else {
-        &creds.session_key
-    };
+    // Always send the ROTATING session key — the non-expiring master token
+    // must never ride on routine polling requests (it multiplies the exposure
+    // surface of the permanent credential for no benefit).
+    if creds.session_key.is_empty() {
+        return Err(AppError::General(
+            "No active hub session. Refresh the session or log in again.".to_string(),
+        ));
+    }
+    let token = &creds.session_key;
 
     let resp = client
         .get(&url)
@@ -1165,6 +1169,23 @@ pub fn provider_save(
     let app_data_dir = state.require_app_data_dir()?;
     let mgr = ProviderConfigManager::new(&app_data_dir)?;
     let mut cfg = mgr.load()?;
+
+    // The `kuda_hub` provider is the vendor service, not a user-configurable
+    // endpoint: hub auth flows attach the non-expiring master token as the
+    // Bearer credential. Letting a compromised renderer retarget it would
+    // exfiltrate that credential to an attacker server.
+    let is_hub_provider = id.as_deref() == Some("kuda_hub");
+    if is_hub_provider {
+        let official = crate::agent::provider_config::HUB_BASE_URL
+            .trim_end_matches('/')
+            .to_string();
+        if base_url.trim_end_matches('/') != official {
+            return Err(AppError::General(format!(
+                "The Kuda Hub base URL is fixed to '{}' and cannot be changed.",
+                official
+            )));
+        }
+    }
 
     let provider = if let Some(existing_id) = id {
         let mut p = cfg

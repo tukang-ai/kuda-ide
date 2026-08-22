@@ -24,12 +24,14 @@ pub fn history_list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionSu
 
 /// Reverts every file touched by one agent run / edit session back to its
 /// state before the session: modified files are fully restored, created files
-/// are removed, deleted files are restored. Returns the affected paths.
+/// are removed, deleted files are restored. Returns both the reverted paths
+/// and per-file failure reasons (a locked file no longer aborts the whole
+/// revert mid-loop).
 #[tauri::command]
 pub fn history_revert_session(
     state: State<'_, AppState>,
     session_id: String,
-) -> Result<Vec<PathBuf>> {
+) -> Result<crate::diff_engine::history::RevertSessionResult> {
     let app_data_dir = state.require_app_data_dir()?;
     let project_root = state.require_project_root()?;
     let mgr = CheckpointManager::new(&app_data_dir)?;

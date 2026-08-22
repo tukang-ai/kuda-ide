@@ -28,6 +28,16 @@ fn default_true() -> bool {
     true
 }
 
+/// Outcome of `revert_session`: the files that rolled back successfully plus a
+/// human-readable entry per file that could NOT be reverted (locked, missing
+/// backup, permission denied). Surfacing failures prevents the old behavior
+/// where one bad file silently left the tree half-reverted.
+#[derive(Serialize, Debug)]
+pub struct RevertSessionResult {
+    pub reverted: Vec<PathBuf>,
+    pub failed: Vec<String>,
+}
+
 /// A group of checkpoints created by one agent run / edit session.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SessionSummary {
@@ -177,10 +187,22 @@ impl CheckpointManager {
                     let file_entry = file_entry?;
                     let file_path = file_entry.path();
                     if file_path.extension().and_then(|e| e.to_str()) == Some("json") {
-                        if let Ok(content) = fs::read_to_string(&file_path) {
-                            if let Ok(checkpoint) = serde_json::from_str::<FileCheckpoint>(&content) {
-                                checkpoints.push(checkpoint);
-                            }
+                        // Corrupt metadata must not vanish silently: a torn
+                        // JSON (crash mid-write) used to make the checkpoint
+                        // invisible — and if every meta of a session was
+                        // unreadable, revert reported "nothing to revert"
+                        // while orphaned .bak payloads sat on disk.
+                        match fs::read_to_string(&file_path)
+                            .map_err(|e| e.to_string())
+                            .and_then(|c| {
+                                serde_json::from_str::<FileCheckpoint>(&c).map_err(|e| e.to_string())
+                            }) {
+                            Ok(checkpoint) => checkpoints.push(checkpoint),
+                            Err(e) => tracing::warn!(
+                                "Skipping corrupt checkpoint metadata {:?}: {}",
+                                file_path,
+                                e
+                            ),
                         }
                     }
                 }
@@ -197,6 +219,52 @@ impl CheckpointManager {
             .into_iter()
             .find(|c| c.checkpoint_id == checkpoint_id)
             .ok_or_else(|| AppError::General(format!("Checkpoint {} not found", checkpoint_id)))
+    }
+
+    /// Deletes checkpoints (metadata + backup payload) older than
+    /// `max_age_days`. Called opportunistically at project open: every Cmd+S
+    /// and agent edit stores a FULL file copy, so without pruning the history
+    /// directory grew without bound. Failures are logged and ignored — pruning
+    /// must never block or fail a project open.
+    pub fn prune_old_sessions(&self, max_age_days: u64) -> usize {
+        let cutoff = Utc::now() - chrono::Duration::days(max_age_days as i64);
+        let mut pruned = 0usize;
+        let Ok(entries) = fs::read_dir(&self.history_root_dir) else {
+            return 0;
+        };
+        for dir_entry in entries.flatten() {
+            let dir_path = dir_entry.path();
+            if !dir_path.is_dir() {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(&dir_path) else { continue };
+            for file_entry in files.flatten() {
+                let file_path = file_entry.path();
+                if file_path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(content) = fs::read_to_string(&file_path) else { continue };
+                let Ok(checkpoint) = serde_json::from_str::<FileCheckpoint>(&content) else {
+                    continue;
+                };
+                if checkpoint.timestamp >= cutoff {
+                    continue;
+                }
+                // Delete payload first: an interrupted prune leaves at most an
+                // orphaned metadata entry (which is skipped as corrupt on
+                // restore), never a dangling reference from live state.
+                if checkpoint.backup_file_path.exists() {
+                    let _ = fs::remove_file(&checkpoint.backup_file_path);
+                }
+                if fs::remove_file(&file_path).is_ok() {
+                    pruned += 1;
+                }
+            }
+        }
+        if pruned > 0 {
+            tracing::info!("Pruned {} expired checkpoint(s) (older than {}d)", pruned, max_age_days);
+        }
+        pruned
     }
 
     /// Groups checkpoints by edit-session id, newest session first.
@@ -243,13 +311,24 @@ impl CheckpointManager {
     /// - files that existed before -> restored from their first snapshot
     /// - files created during the session -> deleted
     /// - files deleted during the session -> restored from the pre-delete snapshot
-    pub fn revert_session(&self, session_id: &str, project_root: &Path) -> Result<Vec<PathBuf>> {
+    /// Per-file failures (locked file, permission denied, missing backup) no
+    /// longer abort the loop after half the tree was restored: every file is
+    /// attempted, and failures are reported alongside the reverted paths so
+    /// the UI can show exactly what did and did not roll back.
+    pub fn revert_session(
+        &self,
+        session_id: &str,
+        project_root: &Path,
+    ) -> Result<RevertSessionResult> {
         let checkpoints = self.checkpoints_for_session(session_id)?;
         if checkpoints.is_empty() {
             // A run that never edited a file produces no checkpoints. There is
             // nothing to revert, so return an empty result instead of an error —
             // the UI surfaces this as a graceful "nothing to revert" notice.
-            return Ok(Vec::new());
+            return Ok(RevertSessionResult {
+                reverted: Vec::new(),
+                failed: Vec::new(),
+            });
         }
 
         // Keep the EARLIEST checkpoint per file so we return to pre-session state.
@@ -268,71 +347,95 @@ impl CheckpointManager {
         }
 
         let mut restored = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
         for checkpoint in by_file {
-            let target_file =
-                PathGuard::validate_path_in_scope(&checkpoint.original_file_path, project_root)?;
-
-            // SAFETY NET: snapshot the CURRENT content before it is overwritten
-            // or removed. Without this, reverting a session destroys any work
-            // done after that session (manual edits or later runs)
-            // irreversibly. The safety snapshot is a normal checkpoint tagged
-            // "pre-revert", so the revert itself stays undoable.
-            if target_file.exists() {
-                self.create_checkpoint_in_session(
-                    &target_file,
-                    Some("pre-revert".to_string()),
-                    None,
-                )
-                .map_err(|e| {
-                    AppError::General(format!(
-                        "Refusing to revert session '{}': cannot snapshot current state of {:?}: {}",
-                        session_id, target_file, e
-                    ))
-                })?;
-            }
-
-            if !checkpoint.existed_before {
-                // File was created during the session -> remove it.
-                if target_file.exists() {
-                    fs::remove_file(&target_file)?;
-                    tracing::info!(
-                        "Revert session {}: removed created file {:?}",
+            match self.revert_single_checkpoint(&checkpoint, project_root, session_id) {
+                Ok(path) => restored.push(path),
+                Err(e) => {
+                    tracing::error!(
+                        "Revert session {}: failed to revert {:?}: {}",
                         session_id,
-                        target_file
+                        checkpoint.original_file_path,
+                        e
                     );
+                    failed.push(format!(
+                        "{:?}: {}",
+                        checkpoint.original_file_path, e
+                    ));
                 }
-            } else {
-                if !checkpoint.backup_file_path.exists() {
-                    return Err(AppError::General(format!(
-                        "Backup file does not exist: {:?}",
-                        checkpoint.backup_file_path
-                    )));
-                }
-                let backup_bytes = fs::read(&checkpoint.backup_file_path)?;
-                if let Some(parent) = target_file.parent() {
-                    if !parent.exists() {
-                        fs::create_dir_all(parent)?;
-                    }
-                }
-                // Unique staging name (UUID suffix): a fixed name would collide
-                // when two restores of same-stem files (main.rs / main.ts) run
-                // concurrently, corrupting whichever rename lands second.
-                let tmp_path = target_file.with_extension(format!(
-                    "tmp_restore_{}",
-                    &Uuid::new_v4().simple().to_string()[..8]
-                ));
-                fs::write(&tmp_path, &backup_bytes)?;
-                fs::rename(&tmp_path, &target_file)?;
+            }
+        }
+
+        Ok(RevertSessionResult { reverted: restored, failed })
+    }
+
+    /// Reverts ONE file to its pre-session state. Extracted from
+    /// `revert_session` so a single failing file cannot abort the whole loop.
+    fn revert_single_checkpoint(
+        &self,
+        checkpoint: &FileCheckpoint,
+        project_root: &Path,
+        session_id: &str,
+    ) -> Result<PathBuf> {
+        let target_file =
+            PathGuard::validate_path_in_scope(&checkpoint.original_file_path, project_root)?;
+
+        // SAFETY NET: snapshot the CURRENT content before it is overwritten
+        // or removed. Without this, reverting a session destroys any work
+        // done after that session (manual edits or later runs)
+        // irreversibly. The safety snapshot is a normal checkpoint tagged
+        // "pre-revert", so the revert itself stays undoable.
+        if target_file.exists() {
+            self.create_checkpoint_in_session(
+                &target_file,
+                Some("pre-revert".to_string()),
+                None,
+            )
+            .map_err(|e| {
+                AppError::General(format!(
+                    "cannot snapshot current state of {:?}: {}",
+                    target_file, e
+                ))
+            })?;
+        }
+
+        if !checkpoint.existed_before {
+            // File was created during the session -> remove it.
+            if target_file.exists() {
+                fs::remove_file(&target_file)?;
                 tracing::info!(
-                    "Revert session {}: restored full file {:?}",
+                    "Revert session {}: removed created file {:?}",
                     session_id,
                     target_file
                 );
             }
-            restored.push(target_file);
+        } else {
+            if !checkpoint.backup_file_path.exists() {
+                return Err(AppError::General(format!(
+                    "Backup file does not exist: {:?}",
+                    checkpoint.backup_file_path
+                )));
+            }
+            let backup_bytes = fs::read(&checkpoint.backup_file_path)?;
+            if let Some(parent) = target_file.parent() {
+                if !parent.exists() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+            // Unique staging name (UUID suffix): a fixed name would collide
+            // when two restores of same-stem files (main.rs / main.ts) run
+            // concurrently, corrupting whichever rename lands second.
+            crate::file_system::io::atomic_write_preserving_permissions(
+                &target_file,
+                &backup_bytes,
+            )?;
+            tracing::info!(
+                "Revert session {}: restored full file {:?}",
+                session_id,
+                target_file
+            );
         }
-
-        Ok(restored)
+        Ok(target_file)
     }
 
     /// Restores a full file from checkpoint. Copies 100% of backup file over original file.
@@ -381,12 +484,10 @@ impl CheckpointManager {
 
         // 3. Atomic overwrite of original file with full backup content,
         //    using a unique staging name (see revert_session).
-        let tmp_path = target_file.with_extension(format!(
-            "tmp_restore_{}",
-            &Uuid::new_v4().simple().to_string()[..8]
-        ));
-        fs::write(&tmp_path, &backup_bytes)?;
-        fs::rename(&tmp_path, &target_file)?;
+        crate::file_system::io::atomic_write_preserving_permissions(
+            &target_file,
+            &backup_bytes,
+        )?;
 
         tracing::info!(
             "Restored FULL FILE checkpoint {} to {:?}",
@@ -487,8 +588,9 @@ mod tests {
         assert!(ours.files.contains(&existing) && ours.files.contains(&new_file));
 
         // 4. Revert the session.
-        let restored = manager.revert_session(&session, &project_root).unwrap();
-        assert_eq!(restored.len(), 2);
+        let result = manager.revert_session(&session, &project_root).unwrap();
+        assert!(result.failed.is_empty(), "unexpected failures: {:?}", result.failed);
+        assert_eq!(result.reverted.len(), 2);
         assert_eq!(fs::read_to_string(&existing).unwrap(), "original main");
         assert!(!new_file.exists());
         assert_eq!(fs::read_to_string(&other).unwrap(), "other edited");
@@ -507,10 +609,11 @@ mod tests {
 
         // A session id with no checkpoint (run that never edited files) must be
         // a graceful no-op, not an error.
-        let restored = manager
+        let result = manager
             .revert_session("session_with_no_edits", &project_root)
             .unwrap();
-        assert!(restored.is_empty());
+        assert!(result.reverted.is_empty());
+        assert!(result.failed.is_empty());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

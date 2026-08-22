@@ -46,6 +46,16 @@ function parentOf(path: string): string {
   return idx > 0 ? path.slice(0, idx) : path;
 }
 
+// Module-scope in-flight registry for `openFile` (double-click dedupe).
+const pendingOpens = new Set<string>();
+
+// Active file-watcher cleanup (see openProject/closeProject).
+let watcherCleanup: (() => void) | null = null;
+function stopWatcher() {
+  watcherCleanup?.();
+  watcherCleanup = null;
+}
+
 export const useWorkspace = create<WorkspaceState>((set, get) => ({
   projectRoot: null,
   projectName: null,
@@ -72,10 +82,14 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
     });
     await get().refreshDir(info.root);
     // Live-reload open tabs / the explorer when files change on disk.
-    watchProject();
+    // Keep the cleanup so closeProject can stop the watcher — otherwise the
+    // closed tree stayed watched until the NEXT open replaced the slot.
+    stopWatcher();
+    watcherCleanup = watchProject();
   },
 
-  closeProject: () =>
+  closeProject: () => {
+    stopWatcher();
     set({
       projectRoot: null,
       projectName: null,
@@ -83,7 +97,8 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
       dirEntries: {},
       tabs: [],
       activePath: null,
-    }),
+    });
+  },
 
   refreshDir: async (path) => {
     set((s) => ({ loadingDirs: { ...s.loadingDirs, [path]: true } }));
@@ -123,9 +138,19 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
     const { tabs } = get();
     const existing = tabs.find((t) => t.path === path);
     if (!existing) {
+      // In-flight dedupe: a fast double-click used to pass the `existing`
+      // lookup twice before either fsReadFile resolved, appending duplicate
+      // tabs (and duplicate React keys).
+      if (pendingOpens.has(path)) return;
+      pendingOpens.add(path);
       get().setStatus(`Opening ${nameOf(path)}…`);
       try {
         const payload = await ipc.fsReadFile(path);
+        // Re-check after the await — the first invocation may have won.
+        if (useWorkspace.getState().tabs.some((t) => t.path === path)) {
+          set({ activePath: path });
+          return;
+        }
         const tab: OpenTab = {
           path,
           name: nameOf(path),
@@ -137,6 +162,8 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
       } catch (err) {
         get().setStatus(`Cannot open file: ${String(err)}`);
         return;
+      } finally {
+        pendingOpens.delete(path);
       }
     } else {
       set({ activePath: path });
@@ -177,8 +204,14 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
       tabs: s.tabs.map((t) =>
         t.path === path ? { ...t, content, savedContent: content } : t,
       ),
+      // Prune counters for tabs that no longer exist — the map used to grow
+      // forever across project switches (one key per externally-reloaded file).
       reloadingFromDisk: {
-        ...s.reloadingFromDisk,
+        ...Object.fromEntries(
+          Object.entries(s.reloadingFromDisk).filter(([p]) =>
+            s.tabs.some((t) => t.path === p),
+          ),
+        ),
         [path]: (s.reloadingFromDisk[path] ?? 0) + 1,
       },
     })),
@@ -187,9 +220,21 @@ export const useWorkspace = create<WorkspaceState>((set, get) => ({
     const tab = get().tabs.find((t) => t.path === path);
     if (!tab) return;
     try {
-      await ipc.fsWriteFile(path, tab.content);
+      // Staleness precondition: hash of what this tab BELIEVES is on disk
+      // (savedContent). If the agent or another process rewrote the file in
+      // the meantime, the backend refuses the save instead of silently
+      // destroying their work (lost-update guard).
+      const expectedSha = await ipc.sha256Hex(tab.savedContent);
+      const contentToWrite = tab.content;
+      await ipc.fsWriteFile(path, contentToWrite, undefined, expectedSha);
+      // Post-write reconcile: keystrokes that landed DURING the await must not
+      // be marked as saved — keep the tab dirty so the next Cmd+S picks them up.
       set((s) => ({
-        tabs: s.tabs.map((t) => (t.path === path ? { ...t, savedContent: tab.content } : t)),
+        tabs: s.tabs.map((t) =>
+          t.path === path && t.content === contentToWrite
+            ? { ...t, savedContent: contentToWrite }
+            : t,
+        ),
         statusMessage: `Saved ${tab.name}`,
       }));
       setTimeout(() => {
@@ -212,12 +257,17 @@ export function isDirty(tab: OpenTab): boolean {
 }
 
 export async function reloadOpenTabsFromDisk(): Promise<void> {
-  const { tabs, applyExternalContent, reloadAllExpanded } = useWorkspace.getState();
-  for (const tab of tabs) {
+  const { applyExternalContent, reloadAllExpanded } = useWorkspace.getState();
+  for (const tab of useWorkspace.getState().tabs) {
     try {
       const payload = await ipc.fsReadFile(tab.path);
-      const dirty = tab.content !== tab.savedContent;
-      if (!dirty && payload.content !== tab.content) {
+      // Re-check dirtiness AFTER the await against FRESH state: the user may
+      // have typed while the file was being read. Applying based on the stale
+      // pre-await snapshot silently clobbered those keystrokes.
+      const fresh = useWorkspace.getState().tabs.find((t) => t.path === tab.path);
+      if (!fresh) continue;
+      const dirty = fresh.content !== fresh.savedContent;
+      if (!dirty && payload.content !== fresh.content) {
         applyExternalContent(tab.path, payload.content);
       }
     } catch {
@@ -247,7 +297,11 @@ export function watchProject(): () => void {
         ipc
           .fsReadFile(path)
           .then((payload) => {
-            if (payload.content !== tab.content) {
+            // Re-check dirtiness AFTER the await from fresh state: keystrokes
+            // that landed during the read must win over disk content.
+            const fresh = useWorkspace.getState().tabs.find((t) => t.path === path);
+            if (!fresh || fresh.content !== fresh.savedContent) return;
+            if (payload.content !== fresh.content) {
               useWorkspace.getState().applyExternalContent(path, payload.content);
             }
           })

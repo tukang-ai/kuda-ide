@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' http://localhost:8090 http://127.0.0.1:8090 ws://localhost:8090 https://generativelanguage.googleapis.com https://api.anthropic.com;"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: https:; object-src 'none'; base-uri 'self'; connect-src 'self' http://localhost:8090 http://127.0.0.1:8090 https://kuda-ide.my.id https://generativelanguage.googleapis.com https://api.anthropic.com;"
     }
   },
   "bundle": {

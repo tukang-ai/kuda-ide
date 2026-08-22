@@ -16,10 +16,11 @@ pub fn search_replace(
     state: State<'_, AppState>,
     query: SearchQuery,
     replacement: String,
+    files: Option<Vec<String>>,
 ) -> Result<crate::indexer::search::SearchReplaceResult> {
     let root = state.require_project_root()?;
     let app_data = state.require_app_data_dir()?;
-    CodeSearcher::replace(&query, &replacement, &root, &app_data)
+    CodeSearcher::replace(&query, &replacement, &root, &app_data, files.as_deref())
 }
 
 #[tauri::command]

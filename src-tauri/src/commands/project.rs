@@ -35,6 +35,13 @@ pub fn project_open(app: AppHandle, state: State<'_, AppState>, path: String) ->
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| root.to_string_lossy().to_string());
 
+    // Opportunistic housekeeping: full-file snapshots from Cmd+S and agent
+    // edits accumulate forever — prune anything older than 30 days. Best
+    // effort; never blocks or fails the open.
+    if let Ok(mgr) = crate::diff_engine::history::CheckpointManager::new(&app_data_dir) {
+        mgr.prune_old_sessions(30);
+    }
+
     tracing::info!("Opened project '{}' at {:?}", name, root);
 
     Ok(ProjectInfo {
