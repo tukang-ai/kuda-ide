@@ -8,6 +8,8 @@ rust-version = "1.80"
 # === Tauri Core ===
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+# setrlimit hardening untuk proses kernel Python (RLIMIT_CPU/AS/FSIZE).
+libc = "0.2"
 
 # === Async Runtime & Traits ===
 tokio = { version = "1", features = ["full"] }

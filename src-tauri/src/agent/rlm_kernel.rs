@@ -1080,6 +1080,30 @@ pub struct RlmKernelProcess {
 }
 
 impl RlmKernelProcess {
+    /// Seatbelt profile for the kernel process (macOS). Deny-by-default:
+    /// reads are allowed everywhere (the kernel is read-only by design),
+    /// writes ONLY into the per-process scratch dir, and NO network at all —
+    /// belt-and-suspenders beneath the in-process Python guards. Opt out with
+    /// `KUDA_RLM_NO_SEATBELT=1` (e.g. if a future macOS removes
+    /// `/usr/bin/sandbox-exec`).
+    fn seatbelt_profile(scratch: &Path) -> String {
+        format!(
+            r#"(version 1)
+(deny default)
+(allow process-exec)
+(allow process-fork)
+(allow file-read*)
+(allow sysctl-read)
+(allow mach-lookup)
+(allow system-socket)
+(deny network*)
+(allow file-write* (subpath "{scratch}"))
+(allow file-write* (subpath "/dev/null"))
+"#,
+            scratch = scratch.display()
+        )
+    }
+
     pub async fn spawn(project_root: &Path, allowlist: &[PathBuf]) -> Result<Self> {
         let mut cmd = tokio::process::Command::new("python3");
         // `-I` (isolated mode) is CRITICAL here: without it sys.path[0] is the
@@ -1095,6 +1119,65 @@ impl RlmKernelProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // Resource ceilings (unix): a backstop INDEPENDENT of our timeout
+        // kill. CPU seconds terminate runaway pure-CPU loops even if the
+        // async timer races; FSIZE makes any accidental write self-limiting;
+        // AS caps address-space bombs (macOS treats this as advisory-ish but
+        // still enforces hard failures on huge mmaps). Failures are ignored —
+        // best-effort hardening must never block the kernel from starting.
+        #[cfg(unix)]
+        {
+            const MAX_CPU_SECS: u64 = 130; // > max snippet timeout (120) + margin
+            const MAX_FSIZE: u64 = 16 * 1024 * 1024;
+            #[cfg(target_os = "macos")]
+            const MAX_AS: u64 = 4 * 1024 * 1024 * 1024; // 4 GB: generous VSZ headroom
+            #[cfg(not(target_os = "macos"))]
+            const MAX_AS: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+            unsafe {
+                cmd.pre_exec(move || {
+                    // Resource constants carry the platform-specific
+                    // `rlimit_resource_t`/c_int type via inference.
+                    let set = |res, cur: u64, max: u64| unsafe {
+                        let lim = libc::rlimit { rlim_cur: cur, rlim_max: max };
+                        libc::setrlimit(res, &lim);
+                    };
+                    set(libc::RLIMIT_CPU, MAX_CPU_SECS, MAX_CPU_SECS + 10);
+                    set(libc::RLIMIT_FSIZE, MAX_FSIZE, MAX_FSIZE);
+                    set(libc::RLIMIT_AS, MAX_AS, MAX_AS);
+                    Ok(())
+                });
+            }
+        }
+
+        // macOS Seatbelt wrap (see `seatbelt_profile`). If sandbox-exec is
+        // missing or refuses to start we fall back to the unwrapped command —
+        // degraded containment beats no IDE feature at all.
+        let scratch = rlm_scratch_dir();
+        #[cfg(target_os = "macos")]
+        let seatbelt_enabled =
+            std::env::var("KUDA_RLM_NO_SEATBELT").map(|v| v != "1").unwrap_or(true);
+        #[cfg(not(target_os = "macos"))]
+        let seatbelt_enabled = false;
+
+        if seatbelt_enabled {
+            let profile_path = scratch.join(format!("seatbelt_{}.sb", std::process::id()));
+            if std::fs::write(&profile_path, Self::seatbelt_profile(&scratch)).is_ok() {
+                let mut sb = tokio::process::Command::new("/usr/bin/sandbox-exec");
+                sb.arg("-f")
+                    .arg(&profile_path)
+                    .arg("python3");
+                for a in ["-I", "-u", "-i", "-q"] {
+                    sb.arg(a);
+                }
+                sb.current_dir(project_root)
+                    .kill_on_drop(true)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                cmd = sb;
+            }
+        }
 
         let mut child = cmd.spawn().map_err(|e| {
             AppError::General(format!(

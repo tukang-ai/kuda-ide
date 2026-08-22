@@ -127,10 +127,33 @@ pub async fn agent_hub_user_usage(
     Ok(val)
 }
 
-/// Signs out of the hub: removes the file-backed credentials and keychain mirror.
+/// Signs out of the hub. SERVER-SIDE revoke first (best-effort): rotates the
+/// master token and wipes every session on the hub so a copied credential
+/// dies with the sign-out instead of staying valid forever. Local cleanup
+/// always proceeds afterwards — even when the hub is unreachable.
 #[tauri::command]
-pub fn agent_hub_sign_out(state: State<'_, AppState>) -> Result<()> {
+pub async fn agent_hub_sign_out(state: State<'_, AppState>) -> Result<()> {
     let app_data_dir = state.require_app_data_dir()?;
+    if let Some(creds) = crate::agent::hub_session::HubCredentialStore::load(&app_data_dir) {
+        let master = if creds.master_token.is_empty() {
+            crate::agent::key_store::KeyStore::get_api_key_from_keychain("kuda_hub_master").ok()
+        } else {
+            Some(creds.master_token)
+        };
+        if let Some(master) = master {
+            let base = crate::agent::provider_config::HUB_BASE_URL.trim_end_matches('/');
+            if let Ok(client) = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(6))
+                .build()
+            {
+                let _ = client
+                    .post(format!("{}/auth/logout", base))
+                    .header("Authorization", format!("Bearer {}", master))
+                    .send()
+                    .await;
+            }
+        }
+    }
     crate::agent::hub_session::clear_hub_credentials(&app_data_dir)
 }
 
@@ -153,21 +176,15 @@ pub async fn agent_poll_hub_login(
     }
 
     let base_url = crate::agent::provider_config::HUB_BASE_URL.trim_end_matches('/');
-    // Percent-encode the verifier: interpolating it raw into the query string
-    // let characters like `&`, `#` or `%` inject extra query parameters toward
-    // the Hub auth endpoint (textbook parameter injection).
-    let verifier_encoded: String = verifier_clean
-        .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            other => format!("%{:02X}", other),
-        })
-        .collect();
-    let url = format!("{}/auth/pending?verifier={}", base_url, verifier_encoded);
+    // The verifier is a BEARER credential: send it in the `X-Kuda-Verifier`
+    // HEADER, never the URL — proxies/CDNs retain query strings in access
+    // logs. (Server accepts the header first, query only as rollout fallback.)
+    let url = format!("{}/auth/pending", base_url);
 
-    let resp = client.get(&url).send().await
+    let resp = client.get(&url)
+        .header("X-Kuda-Verifier", verifier_clean)
+        .send()
+        .await
         .map_err(|e| AppError::General(format!("Hub poll network error: {e}")))?;
 
     if !resp.status().is_success() {
@@ -260,7 +277,9 @@ pub async fn auth_start_github_pkce(
 
     // 4. Spawn autonomous Tokio task in Rust
     let poll_client = client.clone();
-    let poll_url = format!("{}/auth/pending?verifier={}", base_url, verifier);
+    // Verifier rides the X-Kuda-Verifier header, not the query string (see
+    // `agent_poll_hub_login`) so it never lands in proxy access logs.
+    let poll_url = format!("{}/auth/pending", base_url);
     let app_handle = app.clone();
 
     tokio::spawn(async move {
@@ -270,7 +289,7 @@ pub async fn auth_start_github_pkce(
         while started.elapsed() < max_duration {
             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
-            if let Ok(resp) = poll_client.get(&poll_url).send().await {
+            if let Ok(resp) = poll_client.get(&poll_url).header("X-Kuda-Verifier", &verifier).send().await {
                 if resp.status().is_success() {
                     if let Ok(auth) = resp.json::<crate::agent::hub_session::HubSessionInfo>().await {
                         if !auth.token_key.is_empty() {

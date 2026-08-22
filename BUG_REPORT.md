@@ -134,17 +134,25 @@ Commit: `97e3707` (batch 1–3) dan `8b0d4d5` (batch 4) pada `main`.
 
 ---
 
-## ⚠️ Residu Terdokumentasi (Tidak Diperbaiki — Butuh Keputusan/Koordinasi)
+## ⚠️ Residu Terdokumentasi
 
-| ID | Item | Alasan Ditunda |
-|----|----------------------|
-| R1 | **Sandbox OS-level** (`sandbox-exec`/Seatbelt atau container/uid terpisah) di sekeliling kernel Python | Rekomendasi struktural #1 dari adversarial review: containment pure-Python terhadap kode hostil tidak akan pernah sempurna. Perubahan arsitektural, butuh keputusan distribusi |
-| R2 | `RLIMIT_AS`/`RLIMIT_NPROC` via `pre_exec` (anti memory/thread bomb) | Butuh dependensi `libc` atau deklarasi FFI manual; macOS menangani RLIMIT_AS secara beda |
-| R3 | `DirEntry.stat()` pada symlink masih men-stat target di level C (kebocoran metadata existence/size) | Memfilter entries mahal; dampak rendah (tanpa isi file) |
-| R4 | Block `import sys` transitif membuat beberapa paket stdlib murni (`multiprocessing`, `runpy`, `pickle`) gagal impor | Ini justru salah satu penghalang kecelakaan menuju spawn; melonggarkan butuh testing luas |
-| R5 | PKCE verifier dikirim di **query-string** `/auth/pending?verifier=…` (berpotensi masuk access log Cloudflare) | Kontrak API hub sisi server; butuh dukungan header/body dari server sebelum klien berubah |
-| R6 | Sign Out tidak melakukan revoke sisi server (master token tetap valid di hub) | Belum ada endpoint revoke yang diketahui di hub; butuh koordinasi backend |
-| R7 | Kredensial hub plaintext di Windows tanpa ACL ketat | Hardening Windows-specific (ACL/keyring) belum dieksekusi. *Sub-item `unwrap_or_default()` sudah diperbaiki di commit `021fea6`.* |
+> Pembaruan (commit `fix(residual)`): dengan akses ke repo **kuda-hub-server**, residu yang butuh koordinasi server kini diperbaiki dari kedua sisi. Status terbaru:
+
+| ID | Item | Status |
+|----|----------------------|--------|
+| R1 | Sandbox OS-level | ✅ **DIPERBAIKI** — Seatbelt (`sandbox-exec`) deny-default untuk kernel Python di macOS: tulis hanya scratch dir, **network* ditolak** (diverifikasi empiris: socket mentah → `PermissionError`), fallback otomatis bila sandbox-exec tak ada; opt-out `KUDA_RLM_NO_SEATBELT=1` |
+| R2 | RLIMIT via `pre_exec` | ✅ **DIPERBAIKI** — `RLIMIT_CPU` 130s / `FSIZE` 16MB / `AS` 4GB (macOS) sebagai backstop independen dari timeout kill |
+| R3 | Kebocoran metadata `DirEntry.stat()` pada symlink | Diterima (mahal difilter; tanpa isi file) |
+| R4 | Block `sys` transitif mematikan import sebagian stdlib murni | Tradeoff keamanan sengaja dipertahankan |
+| R5 | PKCE verifier di query-string | ✅ **DIPERBAIKI** — klien mengirim header `X-Kuda-Verifier`; server memprioritaskan header, query hanya fallback rollout (server: `/auth/pending`) |
+| R6 | Sign Out tanpa revoke server | ✅ **DIPERBAIKI** — endpoint baru `POST /api/v1/auth/logout` (rotasi master token + hapus semua session key); sign-out klien memanggilnya sebelum bersih-bersih lokal |
+| R7 | ACL ketat file kredensial Windows | Tertunda (perlu mesin Windows untuk uji); `unwrap_or_default` sudah fix di `021fea6` |
+
+Bonus server-side yang ikut diperbaiki saat koordinasi (dari review lengkap `docs/SECURITY_REVIEW.md` di repo hub):
+- Rate-limit `/auth/pending` 30→60/menit (self-DoS polling IDE 40/menit)
+- Real-IP trusted-proxy (`TRUST_PROXY=1`: CF-Connecting-IP/X-Real-IP/XFF) — sebelumnya SEMUA klien berbagi satu bucket rate di balik reverse proxy
+- Escape `token_key` di HTML sukses OAuth
+- Fix double-credit webhook booster + phantom-account credit (gagal resolve → 503 + unmark idempotency agar Midtrans retry)
 
 ---
 
